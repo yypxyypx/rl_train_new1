@@ -34,14 +34,18 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-# 从 config.sh 读取默认值
-CONFIG_FILE="${SCRIPT_DIR}/config.sh"
-if [ -f "$CONFIG_FILE" ]; then
-    source "$CONFIG_FILE"
+# 优先读取中心配置，回退到本地 config.sh
+CENTRAL_CONFIG="${REPO_ROOT}/config/benchmark.sh"
+LOCAL_CONFIG="${SCRIPT_DIR}/config.sh"
+if [ -f "$CENTRAL_CONFIG" ]; then
+    source "$CENTRAL_CONFIG"
+elif [ -f "$LOCAL_CONFIG" ]; then
+    source "$LOCAL_CONFIG"
 fi
 
-# 确保变量有初始值（config.sh 未定义时兜底）
+# 确保变量有初始值（config 未定义时兜底）
 OUTPUT_ROOT="${OUTPUT_ROOT:-}"
 METRICS="${METRICS:-all}"
 GPU="${GPU:-0}"

@@ -34,21 +34,29 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PYTHON="${PYTHON:-python3}"
 
-# ── Parse arguments ──────────────────────────────────────────
-DATASET=""
-DATASET_PATH=""
-MODEL="gen3r"
-OUTPUT=""
-TARGET_SIZE=""
-NUM_FRAMES=""
-SAMPLE_MODE="fixed"
-MAX_SAMPLES="0"
-SKIP_DONE=""
-INCLUDE_DEPTH=""
-QUIET=""
+# ── 从中心配置文件加载默认值 ──────────────────────────────────
+CONFIG_FILE="${REPO_ROOT}/config/data_process.sh"
+if [[ -f "$CONFIG_FILE" ]]; then
+    source "$CONFIG_FILE"
+fi
 
+# ── 确保变量有初始值（config 未定义时兜底）───────────────────
+DATASET="${DATASET:-}"
+DATASET_PATH="${DATASET_PATH:-}"
+MODEL="${MODEL:-gen3r}"
+OUTPUT="${OUTPUT:-}"
+TARGET_SIZE="${TARGET_SIZE:-}"
+NUM_FRAMES="${NUM_FRAMES:-}"
+SAMPLE_MODE="${SAMPLE_MODE:-fixed}"
+MAX_SAMPLES="${MAX_SAMPLES:-0}"
+SKIP_DONE="${SKIP_DONE:-}"
+INCLUDE_DEPTH="${INCLUDE_DEPTH:-}"
+QUIET="${QUIET:-}"
+
+# ── 命令行参数覆盖 config 值 ─────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dataset)       DATASET="$2"; shift 2 ;;

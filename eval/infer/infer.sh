@@ -33,30 +33,38 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 PYTHON="${PYTHON:-python3}"
 
-# ── Defaults ─────────────────────────────────────────────────
-MODEL="gen3r"
-CHECKPOINT=""
-DATA=""
-DATASETS=""
-MANIFEST=""
-SAMPLE_DIR=""
-OUTPUT=""
-NUM_GPUS=1
-NUM_ROLLOUTS=8
-NUM_FRAMES=49
-TARGET_SIZE=560
-ETA=0.3
-STEPS=50
-GUIDANCE=5.0
-SHIFT=2.0
-SEED=42
-SKIP_DONE=""
-DEVICE_MODE="server"
-REQUIRE_GT=""
-MASTER_PORT=29500
+# ── 从中心配置文件加载默认值 ──────────────────────────────────
+CONFIG_FILE="${REPO_ROOT}/config/infer.sh"
+if [[ -f "$CONFIG_FILE" ]]; then
+    source "$CONFIG_FILE"
+fi
 
+# ── 确保变量有初始值（config 未定义时兜底）───────────────────
+MODEL="${MODEL:-gen3r}"
+CHECKPOINT="${CHECKPOINT:-}"
+DATA="${DATA:-}"
+DATASETS="${DATASETS:-}"
+MANIFEST="${MANIFEST:-}"
+SAMPLE_DIR="${SAMPLE_DIR:-}"
+OUTPUT="${OUTPUT:-}"
+NUM_GPUS="${NUM_GPUS:-1}"
+NUM_ROLLOUTS="${NUM_ROLLOUTS:-8}"
+NUM_FRAMES="${NUM_FRAMES:-49}"
+TARGET_SIZE="${TARGET_SIZE:-560}"
+ETA="${ETA:-0.3}"
+STEPS="${STEPS:-50}"
+GUIDANCE="${GUIDANCE:-5.0}"
+SHIFT="${SHIFT:-2.0}"
+SEED="${SEED:-42}"
+SKIP_DONE="${SKIP_DONE:-}"
+DEVICE_MODE="${DEVICE_MODE:-server}"
+REQUIRE_GT="${REQUIRE_GT:-}"
+MASTER_PORT="${MASTER_PORT:-29500}"
+
+# ── 命令行参数覆盖 config 值 ─────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --model)         MODEL="$2"; shift 2 ;;

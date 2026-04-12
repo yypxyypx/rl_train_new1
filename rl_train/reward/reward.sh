@@ -22,18 +22,25 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-# ── 默认值 ──────────────────────────────────────────────────
-VIDEO_PATH=""
-GT_CAMERA_TXT=""
-WORK_DIR=""
-REWARDS="all"
-GPU=0
-PROMPT=""
-METADATA_JSON=""
-NO_SKIP=""
+# ── 从中心配置文件加载默认值 ──────────────────────────────────
+CONFIG_FILE="${REPO_ROOT}/config/reward.sh"
+if [[ -f "$CONFIG_FILE" ]]; then
+    source "$CONFIG_FILE"
+fi
 
-# ── 参数解析 ────────────────────────────────────────────────
+# ── 确保变量有初始值（config 未定义时兜底）───────────────────
+VIDEO_PATH="${VIDEO_PATH:-}"
+GT_CAMERA_TXT="${GT_CAMERA_TXT:-}"
+WORK_DIR="${WORK_DIR:-}"
+REWARDS="${REWARDS:-all}"
+GPU="${GPU:-0}"
+PROMPT="${PROMPT:-}"
+METADATA_JSON="${METADATA_JSON:-}"
+NO_SKIP="${NO_SKIP:-}"
+
+# ── 命令行参数覆盖 config 值 ─────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --video_path)      VIDEO_PATH="$2";      shift 2 ;;

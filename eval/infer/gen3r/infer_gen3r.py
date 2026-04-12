@@ -53,7 +53,7 @@ from torchvision.transforms.functional import resize
 _HERE = Path(__file__).resolve().parent
 _GEN3R_ROOT = Path(os.environ.get(
     "GEN3R_ROOT",
-    str(_HERE.parent.parent.parent / "gen3r" / "Gen3R"),
+    str(_HERE / "Gen3R"),
 ))
 if str(_GEN3R_ROOT) not in sys.path:
     sys.path.insert(0, str(_GEN3R_ROOT))
