@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.venv/
+venv/
+.env
+.env.*
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ML / runs (adjust if you need to track small configs)
+wandb/
+runs/
+outputs/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.onnx
+checkpoints/
+
+# Gen3R: nested upstream clone + large weights — clone/maintain separately or use submodule
+eval/infer/gen3r/Gen3R/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
