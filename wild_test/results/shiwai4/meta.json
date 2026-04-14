@@ -1,0 +1,16 @@
+{
+    "image_name": "shiwai4",
+    "source_file": "shiwai4.webp",
+    "trajectory_type": "track_push_right",
+    "trajectory_config": {
+        "dolly_x": 1.0,
+        "dolly_z": 1.3,
+        "speed": "random_smooth"
+    },
+    "scene_scale": 0.6531250000000001,
+    "num_frames": 49,
+    "resolution": [
+        560,
+        560
+    ]
+}

@@ -1,0 +1,16 @@
+{
+    "image_name": "shinei6",
+    "source_file": "shinei6.png",
+    "trajectory_type": "dive_orbit_right",
+    "trajectory_config": {
+        "orbit_y_deg": 50,
+        "dolly_y": -0.6,
+        "speed": "random_smooth"
+    },
+    "scene_scale": 0.8125,
+    "num_frames": 49,
+    "resolution": [
+        560,
+        560
+    ]
+}

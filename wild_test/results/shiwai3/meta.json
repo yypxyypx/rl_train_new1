@@ -1,0 +1,16 @@
+{
+    "image_name": "shiwai3",
+    "source_file": "shiwai3.png",
+    "trajectory_type": "crane_down",
+    "trajectory_config": {
+        "dolly_y": -1.0,
+        "orbit_x_deg": -12,
+        "speed": "random_smooth"
+    },
+    "scene_scale": 0.759375,
+    "num_frames": 49,
+    "resolution": [
+        560,
+        560
+    ]
+}

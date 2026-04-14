@@ -1,0 +1,17 @@
+{
+    "image_name": "shiwai1",
+    "source_file": "shiwai1.jpeg",
+    "trajectory_type": "spiral_rise_right",
+    "trajectory_config": {
+        "orbit_y_deg": 50,
+        "dolly_z": 1.1,
+        "dolly_y": 0.5,
+        "speed": "random_smooth"
+    },
+    "scene_scale": 0.7375,
+    "num_frames": 49,
+    "resolution": [
+        560,
+        560
+    ]
+}

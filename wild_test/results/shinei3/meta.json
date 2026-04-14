@@ -1,0 +1,16 @@
+{
+    "image_name": "shinei3",
+    "source_file": "shinei3.jpg",
+    "trajectory_type": "rise_orbit_left",
+    "trajectory_config": {
+        "orbit_y_deg": -55,
+        "dolly_y": 0.65,
+        "speed": "random_smooth"
+    },
+    "scene_scale": 0.8500000000000001,
+    "num_frames": 49,
+    "resolution": [
+        560,
+        560
+    ]
+}

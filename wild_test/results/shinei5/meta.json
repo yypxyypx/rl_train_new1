@@ -1,0 +1,16 @@
+{
+    "image_name": "shinei5",
+    "source_file": "shinei5.png",
+    "trajectory_type": "push_in",
+    "trajectory_config": {
+        "dolly_z": 2.2,
+        "orbit_y_deg": 6,
+        "speed": "random_smooth"
+    },
+    "scene_scale": 0.534375,
+    "num_frames": 49,
+    "resolution": [
+        560,
+        560
+    ]
+}

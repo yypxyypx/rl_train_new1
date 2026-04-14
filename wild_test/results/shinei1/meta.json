@@ -1,0 +1,16 @@
+{
+    "image_name": "shinei1",
+    "source_file": "shinei1.png",
+    "trajectory_type": "spiral_in_right",
+    "trajectory_config": {
+        "orbit_y_deg": 55,
+        "dolly_z": 1.4,
+        "speed": "random_smooth"
+    },
+    "scene_scale": 0.6375000000000001,
+    "num_frames": 49,
+    "resolution": [
+        560,
+        560
+    ]
+}
