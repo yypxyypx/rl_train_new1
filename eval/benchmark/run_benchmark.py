@@ -82,8 +82,26 @@ def _get_video_size(video_path: str):
     return H, W
 
 
-def run_metrics(metrics: list, entries: list, device: str, align: str):
-    """按指标列表逐一执行评估。"""
+def _recon_eval_names(recon_json_suffix: str) -> tuple:
+    """返回 (global_point_cloud 文件名, object_point_cloud 文件名)。"""
+    suf = (recon_json_suffix or "").strip()
+    if suf and not suf.startswith("_"):
+        suf = "_" + suf
+    if suf:
+        return f"global_point_cloud{suf}.json", f"object_point_cloud{suf}.json"
+    return "global_point_cloud.json", "object_point_cloud.json"
+
+
+def run_metrics(metrics: list, entries: list, device: str, align: str,
+                n_fps: int = 20000, conf_thresh: float = 0.0,
+                force_recon: bool = False,
+                recon_json_suffix: str = ""):
+    """按指标列表逐一执行评估。
+
+    recon_json_suffix: 非空时写入新文件名（如 mm -> global_point_cloud_mm.json）， 适合 bucket 禁止删除旧 eval 的场景。
+    force_recon: 为 True 时即使输出文件已存在也重算（覆盖写入）。
+    """
+    g_fname, o_fname = _recon_eval_names(recon_json_suffix)
 
     if "video_quality.psnr" in metrics:
         log("── 评估 video_quality.psnr ──")
@@ -216,9 +234,22 @@ def run_metrics(metrics: list, entries: list, device: str, align: str):
         recon_modes.add("object")
 
     if recon_modes:
-        log(f"── 评估 reconstruction ({recon_modes}) ──")
-        from reconstruction.global_point_cloud import evaluate_global_both as eval_gl_both
-        from reconstruction.object_point_cloud import evaluate_object_both_align
+        log(f"── 评估 reconstruction ({recon_modes}, align={align}) ──")
+        from reconstruction.global_point_cloud import (
+            evaluate_global, evaluate_global_multi, evaluate_global_all_align,
+            ALL_ALIGN_MODES,
+        )
+        from reconstruction.object_point_cloud import (
+            evaluate_object, evaluate_object_multi, evaluate_object_all_align,
+        )
+
+        # 将 align 快捷名展开为具体模式列表
+        _ALIGN_EXPAND = {
+            "both_align": ("camera", "first_frame"),
+            "all_align":  ALL_ALIGN_MODES,
+        }
+        align_modes = _ALIGN_EXPAND.get(align, (align,))
+        is_multi = len(align_modes) > 1
 
         for entry in entries:
             camera_txt = entry.get("camera_txt")
@@ -251,34 +282,36 @@ def run_metrics(metrics: list, entries: list, device: str, align: str):
 
                 try:
                     if "global" in recon_modes:
-                        out = gv["gen_dir"] / "eval" / "global_point_cloud.json"
-                        if not out.exists():
-                            if align == "both_align":
-                                result = eval_gl_both(
+                        out = gv["gen_dir"] / "eval" / g_fname
+                        if force_recon or not out.exists():
+                            if is_multi:
+                                result = evaluate_global_multi(
                                     str(da3_pred), gt_depth, gt_K, gt_c2w,
-                                    device=device)
+                                    aligns=align_modes, n_fps=n_fps,
+                                    conf_thresh=conf_thresh, device=device)
                             else:
-                                from reconstruction.global_point_cloud import evaluate_global
                                 result = evaluate_global(
                                     str(da3_pred), gt_depth, gt_K, gt_c2w,
-                                    align=align, device=device)
+                                    align=align_modes[0], n_fps=n_fps,
+                                    conf_thresh=conf_thresh, device=device)
                             save_json(str(out), result)
                             log(f"  global_pc: {Path(gv['video_path']).name}")
 
                     if "object" in recon_modes:
-                        out = gv["gen_dir"] / "eval" / "object_point_cloud.json"
-                        if not out.exists() and pred_masks.exists() and gt_masks_npz.exists():
-                            if align == "both_align":
-                                result = evaluate_object_both_align(
+                        out = gv["gen_dir"] / "eval" / o_fname
+                        if (force_recon or not out.exists()) and pred_masks.exists() and gt_masks_npz.exists():
+                            if is_multi:
+                                result = evaluate_object_multi(
                                     str(pred_masks), str(gt_masks_npz),
                                     str(da3_pred), gt_depth, gt_K, gt_c2w,
-                                    device=device)
+                                    aligns=align_modes, n_fps_global=n_fps,
+                                    conf_thresh=conf_thresh, device=device)
                             else:
-                                from reconstruction.object_point_cloud import evaluate_object
                                 result = evaluate_object(
                                     str(pred_masks), str(gt_masks_npz),
                                     str(da3_pred), gt_depth, gt_K, gt_c2w,
-                                    align=align, device=device)
+                                    align=align_modes[0], n_fps_global=n_fps,
+                                    conf_thresh=conf_thresh, device=device)
                             save_json(str(out), result)
                             log(f"  object_pc: {Path(gv['video_path']).name}")
                 except Exception as e:
@@ -288,17 +321,18 @@ def run_metrics(metrics: list, entries: list, device: str, align: str):
 
 # ═══════════════════ 汇总 ═════════════════════════════════════
 
-def aggregate(entries: list, output_root: Path):
+def aggregate(entries: list, output_root: Path, recon_json_suffix: str = ""):
     """汇总所有评测结果到 results.jsonl 和 summary.json。"""
     log("汇总结果 ...")
     results_dir = output_root / "benchmark_results"
     results_dir.mkdir(exist_ok=True)
 
+    g_fname, o_fname = _recon_eval_names(recon_json_suffix)
+
     all_records = []
     for entry in entries:
         for gv in entry["gen_videos"]:
             gen_dir = gv["gen_dir"]
-            inter_dir = gen_dir / "intermediates"
             eval_dir = gen_dir / "eval"
 
             record = {
@@ -308,15 +342,25 @@ def aggregate(entries: list, output_root: Path):
                 "video_path": gv["video_path"],
             }
 
-            # 从各 eval JSON 读取
             for name in [
                 "psnr_ssim_lpips", "vbench", "camera_pose",
                 "depth_reprojection", "videoalign", "feature_sim",
-                "global_point_cloud", "object_point_cloud",
             ]:
                 data = load_json(str(eval_dir / f"{name}.json"))
                 if data:
                     record[name] = data
+
+            gpc = load_json(str(eval_dir / g_fname))
+            if not gpc:
+                gpc = load_json(str(eval_dir / "global_point_cloud.json"))
+            if gpc:
+                record["global_point_cloud"] = gpc
+
+            opc = load_json(str(eval_dir / o_fname))
+            if not opc:
+                opc = load_json(str(eval_dir / "object_point_cloud.json"))
+            if opc:
+                record["object_point_cloud"] = opc
 
             all_records.append(record)
 
@@ -371,8 +415,11 @@ def _compute_summary(records: list) -> dict:
         ("camera_pose", "rotation_auc30"),
         ("camera_pose", "rotation_auc15"),
         ("camera_pose", "rotation_auc05"),
-        ("camera_pose", "translation_metric"),
         ("camera_pose", "translation_auc30"),
+        ("camera_pose", "translation_auc15"),
+        ("camera_pose", "pose_auc30"),
+        ("camera_pose", "pose_auc15"),
+        ("camera_pose", "translation_metric"),
         ("depth_reprojection", "object", "reward"),
         ("depth_reprojection", "global", "reward"),
         ("videoalign", "Overall"),
@@ -396,13 +443,28 @@ def main():
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--device", default=None, help="覆盖 GPU 设备 (默认 cuda:<gpu>)")
     parser.add_argument("--align", default="both_align",
-                        choices=["camera", "first_frame", "both_align"],
-                        help="重建指标的对齐方式")
+                        choices=["camera", "first_frame", "umeyama", "icp",
+                                 "both_align", "all_align"],
+                        help="重建指标的对齐方式：单模式(camera/first_frame/umeyama/icp)"
+                             " 或组合(both_align=camera+first_frame, all_align=全部四种)")
+    parser.add_argument("--n_fps", type=int, default=20000,
+                        help="重建点云 FPS 采样点数")
+    parser.add_argument("--conf_thresh", type=float, default=0.0,
+                        help="深度置信度阈值（0.0 = 不过滤）")
     parser.add_argument("--vbench_cache", default=None)
     parser.add_argument("--skip_intermediates", action="store_true",
                         help="跳过中间产物生成（假设已存在）")
     parser.add_argument("--aggregate_only", action="store_true",
                         help="只做汇总，不运行评测")
+    parser.add_argument("--force_recon", action="store_true",
+                        help="强制重算点云重建 JSON（覆盖已存在输出文件）")
+    parser.add_argument("--recon_json_suffix", type=str, default="",
+                        help="点云 eval 文件名后缀，如 mm -> global_point_cloud_mm.json（不写旧文件名，适合禁止删除的 bucket）")
+    # 并行分片参数：由 run_benchmark_recompute.py 多进程时注入
+    parser.add_argument("--shard_idx", type=int, default=None,
+                        help="当前进程处理的分片索引（0-based）")
+    parser.add_argument("--n_shards", type=int, default=None,
+                        help="总分片数（与 --shard_idx 配合使用）")
     args = parser.parse_args()
 
     output_root = Path(args.output_root)
@@ -411,19 +473,27 @@ def main():
 
     device = args.device or f"cuda:{args.gpu}"
     metrics = expand_metrics(args.metrics)
-    log(f"展开后的指标: {metrics}")
 
     entries = scan_output_root(args.output_root)
     if not entries:
         log("未找到推理结果，退出")
         return
 
+    # 分片：只处理属于本进程的 entries
+    if args.shard_idx is not None and args.n_shards and args.n_shards > 1:
+        entries = entries[args.shard_idx::args.n_shards]
+        log(f"[分片 {args.shard_idx}/{args.n_shards}] 处理 {len(entries)} 个样本")
+    else:
+        log(f"展开后的指标: {metrics}")
+
     if args.aggregate_only:
-        aggregate(entries, output_root)
+        # aggregate 需要全量 entries，分片模式下不支持
+        if args.shard_idx is None:
+            aggregate(entries, output_root, recon_json_suffix=args.recon_json_suffix)
         return
 
-    # 中间产物调度
-    if not args.skip_intermediates:
+    # 中间产物调度（分片模式下跳过，由主进程或 skip_intermediates 保证）
+    if not args.skip_intermediates and args.shard_idx is None:
         manager = IntermediateManager(gpu=args.gpu, vbench_cache=args.vbench_cache)
         needed_deps = manager.resolve_deps(metrics)
         if needed_deps:
@@ -431,12 +501,15 @@ def main():
             tmp_dir = output_root / "_benchmark_tmp"
             manager.prepare(needed_deps, entries, tmp_dir)
 
-    # 运行评测
-    run_metrics(metrics, entries, device, args.align)
+    run_metrics(metrics, entries, device, args.align,
+                n_fps=args.n_fps, conf_thresh=args.conf_thresh,
+                force_recon=args.force_recon,
+                recon_json_suffix=args.recon_json_suffix)
 
-    # 汇总
-    aggregate(entries, output_root)
-    log("Benchmark 完成")
+    # 汇总只在非分片模式（或最后的主进程汇总阶段）执行
+    if args.shard_idx is None:
+        aggregate(entries, output_root, recon_json_suffix=args.recon_json_suffix)
+        log("Benchmark 完成")
 
 
 if __name__ == "__main__":

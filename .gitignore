@@ -30,8 +30,65 @@ outputs/
 *.onnx
 checkpoints/
 
+# Logs
+*.log
+*.nohup.log
+
+# Common data / image / archive types (avoid accidentally committing big binaries)
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.parquet
+*.feather
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tif
+*.tiff
+*.mp4
+*.mov
+*.avi
+*.webm
+
+# Top-level dataset folders (large raw data — keep out of git)
+/datasets/
+data/alsfna_rl_data/
+data/datasets/dataset_cache/
+
+# Reward pipeline intermediate results
+rl_train/reward_output/
+
+# Reward benchmark test: keep code, drop result artifacts
+rl_train/reward_benchmark_test/results/
+rl_train/reward_benchmark_test/json/
+rl_train/reward_benchmark_test/json_*/
+
+# Smoke test runs
+rl_train/test_smoke/run_*/
+rl_train/test_smoke/data/
+rl_train/test_smoke/t5_cache/
+
+# RL training outputs / cached features
+rl_train/train/gen3r/outputs/
+rl_train/train/gen3r/wandb/
+rl_train/train/gen3r/test_code/results/
+rl_train/train/gen3r/t5_cache/
+
+# Wild test: keep code, drop input images and result artifacts
+wild_test/wild_test_data/
+wild_test/results/
+
 # Gen3R: nested upstream clone + large weights — clone/maintain separately or use submodule
 eval/infer/gen3r/Gen3R/
+rl_train/train/gen3r/Gen3R/
 
 # OS / editor
 .DS_Store

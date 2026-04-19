@@ -66,9 +66,10 @@ def align_to_first_camera(poses: np.ndarray) -> np.ndarray:
     """
     将所有 c2w pose 归一化到首帧坐标系。
     poses: (N, 4, 4) c2w
+    aligned[i] = inv(c2w[0]) @ c2w[i]，使得 aligned[0] = I。
     """
     first_inv = np.linalg.inv(poses[0])
-    return np.array([pose @ first_inv for pose in poses])
+    return np.array([first_inv @ pose for pose in poses])
 
 
 # ═══════════════════ 全帧对误差 ═════════════════════════════════
@@ -86,15 +87,15 @@ def _build_pair_indices(N: int):
 
 def _rotation_angle(R_gt: np.ndarray, R_pred: np.ndarray) -> np.ndarray:
     """
-    计算旋转角度误差（度）。
+    计算旋转角度误差（度）— 测地线距离。
     R_gt, R_pred: (M, 3, 3)
-    返回: (M,) 度
+    返回: (M,) 度，范围 [0, 180]
     """
     q_gt = _mat_to_quat(R_gt)
     q_pred = _mat_to_quat(R_pred)
-    dot = np.sum(q_gt * q_pred, axis=1)
-    loss = np.clip(1.0 - dot ** 2, 1e-15, 1.0)
-    err = np.arccos(np.clip(np.sqrt(1 - loss), -1.0, 1.0))
+    dot = np.abs(np.sum(q_gt * q_pred, axis=1))
+    dot = np.clip(dot, 0.0, 1.0)
+    err = 2.0 * np.arccos(dot)
     return np.degrees(err)
 
 
@@ -139,19 +140,30 @@ def compute_all_pairs_errors(
 # ═══════════════════ AUC 计算 ══════════════════════════════════
 
 
+def _auc_from_errors(
+    errors: np.ndarray, max_threshold: int = 30,
+) -> float:
+    """单一误差序列的 AUC。"""
+    bins = np.arange(max_threshold + 1)
+    histogram, _ = np.histogram(errors, bins=bins)
+    num_pairs = float(len(errors))
+    normalized = histogram.astype(float) / num_pairs
+    return float(np.mean(np.cumsum(normalized)))
+
+
 def calculate_auc(
     r_error: np.ndarray, t_error: np.ndarray, max_threshold: int = 30,
-) -> Tuple[float, np.ndarray]:
+) -> Tuple[float, float, float]:
     """
-    计算 AUC（旋转 + 平移角度误差的 max 取直方图累积和）。
+    分别计算旋转 AUC、平移 AUC 和组合 AUC（max(rot, trans)）。
+
+    返回: (rot_auc, trans_auc, pose_auc)
     """
-    error_matrix = np.column_stack([r_error, t_error])
-    max_errors = np.max(error_matrix, axis=1)
-    bins = np.arange(max_threshold + 1)
-    histogram, _ = np.histogram(max_errors, bins=bins)
-    num_pairs = float(len(max_errors))
-    normalized = histogram.astype(float) / num_pairs
-    return float(np.mean(np.cumsum(normalized))), normalized
+    rot_auc = _auc_from_errors(r_error, max_threshold)
+    trans_auc = _auc_from_errors(t_error, max_threshold)
+    max_errors = np.max(np.column_stack([r_error, t_error]), axis=1)
+    pose_auc = _auc_from_errors(max_errors, max_threshold)
+    return rot_auc, trans_auc, pose_auc
 
 
 # ═══════════════════ 平移距离指标 ═══════════════════════════════
@@ -167,13 +179,16 @@ def compute_translation_metric(
     pred_c2w: np.ndarray, gt_c2w: np.ndarray,
 ) -> Tuple[float, Dict]:
     """
-    平移指标：首帧 pose 对齐 + 尺度对齐 + 逐帧绝对距离。
+    平移指标：首帧 pose 对齐 + 尺度对齐 + 逐帧距离（按 GT 轨迹长度归一化）。
 
-    步骤：
+    与 RL 训练 reward (compute_reward_camera_traj) 对齐：
     1. 将 pred 首帧对齐到 GT 首帧
-    2. 尺度 s = GT轨迹总长度 / pred轨迹总长度
+    2. 尺度 s = GT 轨迹总长度 / pred 轨迹总长度
     3. 逐帧距离 dist_i = ||s * aligned_pred_pos[i] - gt_pos[i]||
-    4. 最终指标 = -exp(mean(dist_i) / 0.3)
+    4. 按 GT 轨迹长度归一化 dist_norm_i = dist_i / gt_traj_len
+       —— 消除不同数据集 / 样本绝对尺度差异的影响
+    5. 最终指标 = mean(-exp(dist_norm_i / 0.3))
+       —— 先 exp 再 mean，与训练 reward 完全一致
 
     pred_c2w, gt_c2w: (N, 4, 4) c2w
     """
@@ -199,16 +214,23 @@ def compute_translation_metric(
     scaled_pos = origin + s * (aligned_pos - origin)
 
     per_frame_dist = np.linalg.norm(scaled_pos - gt_pos, axis=1)
-    mean_dist = float(np.mean(per_frame_dist))
-    metric = float(-np.exp(mean_dist / 0.3))
+    # 按 GT 轨迹长度归一化，消除数据集间绝对尺度差异
+    per_frame_dist_norm = per_frame_dist / (gt_traj_len + 1e-8)
+    # 与训练 reward 完全一致：先逐帧 exp 再求均值
+    per_frame_rewards = -np.exp(per_frame_dist_norm / 0.3)
+    metric = float(np.mean(per_frame_rewards))
 
     details = {
         "scale": s,
         "gt_trajectory_length": gt_traj_len,
         "pred_trajectory_length": pred_traj_len,
-        "mean_distance": mean_dist,
+        "mean_distance": float(np.mean(per_frame_dist)),
+        "median_distance": float(np.median(per_frame_dist)),
+        "mean_distance_norm": float(np.mean(per_frame_dist_norm)),
         "metric": metric,
         "per_frame_distance": per_frame_dist.tolist(),
+        "per_frame_distance_norm": per_frame_dist_norm.tolist(),
+        "per_frame_rewards": per_frame_rewards.tolist(),
     }
     return metric, details
 
@@ -229,70 +251,34 @@ def da3_to_c2w(da3_data: dict) -> np.ndarray:
 # ═══════════════════ 三个接口 ══════════════════════════════════
 
 
-def evaluate_rotation_auc(da3_data: dict, gt_c2w: np.ndarray) -> Dict:
+def evaluate_camera_pose(da3_data: dict, gt_c2w: np.ndarray) -> Dict:
     """
-    旋转 AUC 评估。
+    组合评估：旋转 AUC + 平移方向 AUC + 组合 Pose AUC + 平移距离指标。
 
-    返回: {rotation_auc30, rotation_auc15, rotation_auc05, rotation_auc03,
-           rotation_errors_deg: [...]}
+    返回: {rotation_auc30, translation_auc30, pose_auc30, ...,
+           translation_metric, mean_rotation_error_deg, ..., details}
     """
     pred_c2w = da3_to_c2w(da3_data)
     gt_c2w_4 = _to_4x4(gt_c2w.astype(np.float64))
 
     N = min(len(pred_c2w), len(gt_c2w_4))
-    pred_aligned = align_to_first_camera(pred_c2w[:N])
-    gt_aligned = align_to_first_camera(gt_c2w_4[:N])
 
-    rot_err, trans_err = compute_all_pairs_errors(pred_aligned, gt_aligned)
+    # 全帧对误差（对齐对 compute_all_pairs_errors 是 no-op，保留以防后续用途）
+    rot_err, trans_err = compute_all_pairs_errors(pred_c2w[:N], gt_c2w_4[:N])
 
     result = {}
     for thresh in [30, 15, 5, 3]:
-        auc, _ = calculate_auc(rot_err, trans_err, max_threshold=thresh)
-        result[f"rotation_auc{thresh:02d}"] = auc
+        r_auc, t_auc, p_auc = calculate_auc(rot_err, trans_err, max_threshold=thresh)
+        result[f"rotation_auc{thresh:02d}"] = r_auc
+        result[f"translation_auc{thresh:02d}"] = t_auc
+        result[f"pose_auc{thresh:02d}"] = p_auc
 
     result["mean_rotation_error_deg"] = float(np.mean(rot_err))
     result["mean_translation_angle_error_deg"] = float(np.mean(trans_err))
-    return result
 
-
-def evaluate_translation(da3_data: dict, gt_c2w: np.ndarray) -> Dict:
-    """
-    平移距离评估 + 平移 AUC。
-
-    返回: {translation_metric, translation_auc30, ..., details}
-    """
-    pred_c2w = da3_to_c2w(da3_data)
-    gt_c2w_4 = _to_4x4(gt_c2w.astype(np.float64))
-
-    N = min(len(pred_c2w), len(gt_c2w_4))
-
-    # 距离指标
+    # 平移距离指标
     metric, dist_details = compute_translation_metric(pred_c2w[:N], gt_c2w_4[:N])
-
-    # AUC（使用全帧对）
-    pred_aligned = align_to_first_camera(pred_c2w[:N])
-    gt_aligned = align_to_first_camera(gt_c2w_4[:N])
-    rot_err, trans_err = compute_all_pairs_errors(pred_aligned, gt_aligned)
-
-    result = {"translation_metric": metric}
-    for thresh in [30, 15, 5, 3]:
-        auc, _ = calculate_auc(rot_err, trans_err, max_threshold=thresh)
-        result[f"translation_auc{thresh:02d}"] = auc
-
+    result["translation_metric"] = metric
     result["details"] = dist_details
+
     return result
-
-
-def evaluate_camera_pose(da3_data: dict, gt_c2w: np.ndarray) -> Dict:
-    """
-    组合评估：旋转 AUC + 平移指标。
-
-    返回: {rotation_auc30, ..., translation_metric, translation_auc30, ..., details}
-    """
-    rot_result = evaluate_rotation_auc(da3_data, gt_c2w)
-    trans_result = evaluate_translation(da3_data, gt_c2w)
-
-    combined = {}
-    combined.update(rot_result)
-    combined.update(trans_result)
-    return combined

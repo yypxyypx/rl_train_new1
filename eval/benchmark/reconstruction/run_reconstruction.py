@@ -18,10 +18,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from common import scan_output_root, save_json, log
 from common.utils import parse_camera_txt
 from reconstruction.global_point_cloud import (
-    evaluate_global, evaluate_global_both, evaluate_global_firstframe_only,
+    evaluate_global, evaluate_global_multi,
+    ALL_ALIGN_MODES, VALID_ALIGN_CHOICES,
 )
 from reconstruction.object_point_cloud import (
-    evaluate_object, evaluate_object_both_align, evaluate_reconstruction_both,
+    evaluate_object, evaluate_object_multi,
 )
 
 
@@ -35,10 +36,21 @@ def main():
     parser.add_argument("--output_root", required=True)
     parser.add_argument("--mode", default="both", choices=["object", "global", "both"])
     parser.add_argument("--align", default="both_align",
-                        choices=["camera", "first_frame", "both_align"])
+                        choices=list(VALID_ALIGN_CHOICES),
+                        help="对齐方式：单模式(camera/first_frame/umeyama/icp)"
+                             " 或组合(both_align=camera+first_frame, all_align=全部四种)")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--n_fps", type=int, default=20000)
+    parser.add_argument("--conf_thresh", type=float, default=0.0,
+                        help="深度置信度阈值（0.0 = 不过滤）")
     args = parser.parse_args()
+
+    _ALIGN_EXPAND = {
+        "both_align": ("camera", "first_frame"),
+        "all_align":  ALL_ALIGN_MODES,
+    }
+    align_modes = _ALIGN_EXPAND.get(args.align, (args.align,))
+    is_multi = len(align_modes) > 1
 
     entries = scan_output_root(args.output_root)
     if not entries:
@@ -85,18 +97,16 @@ def main():
             if args.mode in ("global", "both"):
                 out_json = gv["gen_dir"] / "eval" / "global_point_cloud.json"
                 if not out_json.exists():
-                    if args.align == "both_align":
-                        result = evaluate_global_both(
+                    if is_multi:
+                        result = evaluate_global_multi(
                             str(da3_pred), gt_depth, gt_K, gt_c2w,
-                            n_fps=args.n_fps, device=args.device)
-                    elif args.align == "first_frame":
-                        result = evaluate_global_firstframe_only(
-                            str(da3_pred), gt_depth, gt_K, gt_c2w,
-                            n_fps=args.n_fps, device=args.device)
+                            aligns=align_modes, n_fps=args.n_fps,
+                            conf_thresh=args.conf_thresh, device=args.device)
                     else:
                         result = evaluate_global(
                             str(da3_pred), gt_depth, gt_K, gt_c2w,
-                            align=args.align, n_fps=args.n_fps, device=args.device)
+                            align=align_modes[0], n_fps=args.n_fps,
+                            conf_thresh=args.conf_thresh, device=args.device)
                     save_json(str(out_json), result)
                     log(f"  global: {Path(gv['video_path']).name}")
 
@@ -104,14 +114,16 @@ def main():
             if args.mode in ("object", "both"):
                 out_json = gv["gen_dir"] / "eval" / "object_point_cloud.json"
                 if not out_json.exists() and pred_masks.exists() and gt_masks_npz.exists():
-                    if args.align == "both_align":
-                        result = evaluate_object_both_align(
+                    if is_multi:
+                        result = evaluate_object_multi(
                             str(pred_masks), str(gt_masks_npz), str(da3_pred),
-                            gt_depth, gt_K, gt_c2w, device=args.device)
+                            gt_depth, gt_K, gt_c2w, aligns=align_modes,
+                            conf_thresh=args.conf_thresh, device=args.device)
                     else:
                         result = evaluate_object(
                             str(pred_masks), str(gt_masks_npz), str(da3_pred),
-                            gt_depth, gt_K, gt_c2w, align=args.align, device=args.device)
+                            gt_depth, gt_K, gt_c2w, align=align_modes[0],
+                            conf_thresh=args.conf_thresh, device=args.device)
                     save_json(str(out_json), result)
                     log(f"  object: {Path(gv['video_path']).name}")
 

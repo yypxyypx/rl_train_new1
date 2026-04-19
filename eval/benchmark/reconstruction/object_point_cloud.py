@@ -22,7 +22,9 @@ from .global_point_cloud import (
     _to_4x4, depth_to_pointcloud, umeyama_align,
     apply_similarity_transform, align_pointclouds_via_cameras,
     fps_sample, compute_metrics, icp_refine, first_frame_align,
-    evaluate_global, evaluate_global_both,
+    evaluate_global, evaluate_global_both, evaluate_global_multi,
+    evaluate_global_all_align,
+    ALL_ALIGN_MODES, VALID_ALIGN_CHOICES,
 )
 
 
@@ -109,9 +111,10 @@ def evaluate_objects_core(
     if pred_conf is not None:
         pred_conf = pred_conf[:T]
 
-    depth_H, depth_W = pred_depth.shape[1], pred_depth.shape[2]
-    pred_masks = resize_masks_to_depth(pred_masks_raw, depth_H, depth_W)
-    gt_masks = resize_masks_to_depth(gt_masks_raw, depth_H, depth_W)
+    pred_depth_H, pred_depth_W = pred_depth.shape[1], pred_depth.shape[2]
+    gt_depth_H, gt_depth_W = gt_depth_n.shape[1], gt_depth_n.shape[2]
+    pred_masks = resize_masks_to_depth(pred_masks_raw, pred_depth_H, pred_depth_W)
+    gt_masks = resize_masks_to_depth(gt_masks_raw, gt_depth_H, gt_depth_W)
 
     gt_valid = gt_depth_n[gt_depth_n > 1e-3]
     depth_cap = float(np.percentile(gt_valid, 98)) * 2.0 if len(gt_valid) > 0 else 1e6
@@ -124,14 +127,14 @@ def evaluate_objects_core(
         use_gt_cam = True
         use_depth = scaled_depth
         use_c2w = aligned_c2w_34
-        use_K = intrinsics
+        use_K = pred_intr
     elif align == "camera":
         _, _, global_s = umeyama_align(pred_c2w[:, :3, 3], _to_4x4(c2w)[:, :3, 3])
         scaled_depth = np.clip(pred_depth * global_s, 1e-3, depth_cap)
         use_gt_cam = True
         use_depth = scaled_depth
         use_c2w = c2w
-        use_K = intrinsics
+        use_K = pred_intr
     else:
         global_s = 1.0
         use_gt_cam = False
@@ -146,7 +149,7 @@ def evaluate_objects_core(
         return {"per_object": [], "summary": {}, "align_mode": align, "n_objects": 0}
 
     frame0_areas = gt_masks_sel[:, 0, :, :].sum(axis=(1, 2))
-    frame0_ratios = frame0_areas / (depth_H * depth_W)
+    frame0_ratios = frame0_areas / (gt_depth_H * gt_depth_W)
     n_fps_per_obj = np.maximum(n_fps_min, (frame0_ratios * n_fps_global).astype(int)).tolist()
 
     per_object_results = []
@@ -221,7 +224,7 @@ def evaluate_objects_core(
     }
 
 
-# ═══════════════ 三个公开接口 ══════════════════════════════════
+# ═══════════════ 公开接口 ════════════════════════════════════════
 
 
 def evaluate_object(
@@ -231,41 +234,56 @@ def evaluate_object(
     align: str = "camera", device: str = "cpu",
     **kwargs,
 ) -> dict:
-    """仅物体级评估。"""
+    """单一对齐模式物体级评估。align 须为四种基础模式之一。"""
+    assert align in ALL_ALIGN_MODES, \
+        f"align 须为 {ALL_ALIGN_MODES} 之一，组合模式请用 evaluate_object_multi"
     return evaluate_objects_core(
         pred_masks_npz, gt_masks_npz, pred_depth_npz,
         gt_depth, intrinsics, c2w, align=align, device=device, **kwargs)
+
+
+def evaluate_object_multi(
+    pred_masks_npz: str, gt_masks_npz: str,
+    pred_depth_npz: str, gt_depth: np.ndarray,
+    intrinsics: np.ndarray, c2w: np.ndarray,
+    aligns: tuple = ("camera", "first_frame"),
+    device: str = "cpu",
+    **kwargs,
+) -> dict:
+    """同时运行多种对齐模式，返回 {align_name: result} 字典。"""
+    return {
+        mode: evaluate_objects_core(
+            pred_masks_npz, gt_masks_npz, pred_depth_npz,
+            gt_depth, intrinsics, c2w, align=mode, device=device, **kwargs)
+        for mode in aligns
+    }
 
 
 def evaluate_object_both_align(
     pred_masks_npz: str, gt_masks_npz: str,
     pred_depth_npz: str, gt_depth: np.ndarray,
     intrinsics: np.ndarray, c2w: np.ndarray,
-    existing_align: str = "camera", device: str = "cpu",
+    device: str = "cpu",
     **kwargs,
 ) -> dict:
-    """同时运行现有模式 + 首帧对齐。"""
-    result_existing = evaluate_objects_core(
+    """同时运行 camera + first_frame 两种模式。"""
+    return evaluate_object_multi(
         pred_masks_npz, gt_masks_npz, pred_depth_npz,
-        gt_depth, intrinsics, c2w, align=existing_align, device=device, **kwargs)
-    result_ff = evaluate_objects_core(
-        pred_masks_npz, gt_masks_npz, pred_depth_npz,
-        gt_depth, intrinsics, c2w, align="first_frame", device=device, **kwargs)
-    return {existing_align: result_existing, "first_frame": result_ff}
+        gt_depth, intrinsics, c2w,
+        aligns=("camera", "first_frame"),
+        device=device, **kwargs)
 
 
-def evaluate_reconstruction_both(
-    pred_npz: str, gt_depth: np.ndarray,
-    K: np.ndarray, c2w: np.ndarray,
-    pred_masks_npz: Optional[str] = None,
-    gt_masks_npz: Optional[str] = None,
-    align: str = "camera", device: str = "cpu",
+def evaluate_object_all_align(
+    pred_masks_npz: str, gt_masks_npz: str,
+    pred_depth_npz: str, gt_depth: np.ndarray,
+    intrinsics: np.ndarray, c2w: np.ndarray,
+    device: str = "cpu",
     **kwargs,
 ) -> dict:
-    """全局 + 物体级都跑。"""
-    result = {"global": evaluate_global(pred_npz, gt_depth, K, c2w, align=align, device=device)}
-    if pred_masks_npz and gt_masks_npz:
-        result["object"] = evaluate_objects_core(
-            pred_masks_npz, gt_masks_npz, pred_npz,
-            gt_depth, K, c2w, align=align, device=device, **kwargs)
-    return result
+    """同时运行全部四种对齐模式：camera / first_frame / umeyama / icp。"""
+    return evaluate_object_multi(
+        pred_masks_npz, gt_masks_npz, pred_depth_npz,
+        gt_depth, intrinsics, c2w,
+        aligns=ALL_ALIGN_MODES,
+        device=device, **kwargs)

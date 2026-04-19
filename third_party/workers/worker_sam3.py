@@ -2,10 +2,12 @@
 """
 worker_sam3.py
 ==============
-SAM3 批量 worker —— 在 SAM3 conda 环境中运行，一次性处理所有视频。
+SAM3 批量 worker（视频追踪模式）—— 在 SAM3 conda 环境中运行，一次性处理所有视频。
 
-设计原则：Qwen + SAM3 模型各加载一次，顺序处理 batch_manifest 中的所有条目。
+设计原则：Qwen 加载一次做物体识别，SAM3 视频预测器加载一次，
+顺序处理 batch_manifest 中的所有条目。
 GT 视频先跑 Qwen 识别物体，pred 视频复用 GT 的物体列表（跳过 Qwen）。
+SAM3 使用 propagate_in_video 视频追踪模式，比逐帧分割更稳定。
 
 运行方式（由 run_benchmark.py 通过 conda run 调用）：
     conda run -n SAM3 python worker_sam3.py --batch_manifest /path/to/batch.json
@@ -26,6 +28,7 @@ batch_manifest.json 格式：
 """
 
 import argparse
+import gc
 import json
 import os
 import sys
@@ -54,32 +57,38 @@ SAM3_BPE    = str(_SAM3_PKG / "sam3" / "sam3" / "assets" / "bpe_simple_vocab_16e
 SAM3_CONF   = 0.5
 
 
-# ── 帧提取 ────────────────────────────────────────────────────────────────────
+# ── 帧提取（写入磁盘，视频预测器需要帧目录）─────────────────────────────────
 
-def _extract_frames_bgr(video_path: str, max_frames: int = 0) -> list:
-    """从视频提取所有帧（BGR numpy），返回 list of (H, W, 3) uint8。"""
+def _extract_frames_to_dir(video_path: str, out_dir: str, max_frames: int = 0) -> int:
+    """将视频帧提取为 PNG 文件保存到 out_dir，返回提取帧数。"""
+    os.makedirs(out_dir, exist_ok=True)
+    # 若帧已存在则跳过
+    existing = sorted(Path(out_dir).glob("frame_*.png"))
+    if existing:
+        return len(existing)
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"无法打开视频: {video_path}")
-    frames = []
+    idx = 0
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-        frames.append(frame)
-        if max_frames > 0 and len(frames) >= max_frames:
+        cv2.imwrite(os.path.join(out_dir, f"frame_{idx:05d}.png"), frame)
+        idx += 1
+        if max_frames > 0 and idx >= max_frames:
             break
     cap.release()
-    return frames
+    return idx
 
 
 # ── Qwen 物体识别 ─────────────────────────────────────────────────────────────
 
-def _identify_objects(first_frame_bgr: np.ndarray, device: str, qwen_model, qwen_processor) -> list:
+def _identify_objects(first_frame_path: str, device: str, qwen_model, qwen_processor) -> list:
     """用 Qwen3-VL 识别首帧中的显著物体，返回物体名称列表。"""
     from qwen_vl_utils import process_vision_info
 
-    pil_img = Image.fromarray(cv2.cvtColor(first_frame_bgr, cv2.COLOR_BGR2RGB))
+    pil_img = Image.open(first_frame_path).convert("RGB")
 
     system_prompt = (
         "You are a visual object detection assistant. "
@@ -150,84 +159,109 @@ def _identify_objects(first_frame_bgr: np.ndarray, device: str, qwen_model, qwen
     return objs
 
 
-# ── SAM3 分割 ─────────────────────────────────────────────────────────────────
+# ── SAM3 视频追踪 ─────────────────────────────────────────────────────────────
 
-def _segment_video(
-    frames_bgr: list,
+def _track_video(
+    frames_dir: str,
     object_names: list,
-    sam3_processor,
-    device: str,
+    predictor,
+    gpu_idx: int,
 ) -> tuple:
     """
-    对所有帧按物体列表做 SAM3 分割（逐帧精确推理）。
+    SAM3 视频追踪模式，对一个视频的帧目录做多物体追踪。
 
     返回
     ----
-    masks     : (N_obj, T, H, W) bool
-    mean_areas: (N_obj,) float
+    label_maps : (T, H, W) int16
+    masks      : (N_obj, T, H, W) bool
     """
-    import copy
-
-    T = len(frames_bgr)
+    frame_paths = sorted([
+        os.path.join(frames_dir, f)
+        for f in os.listdir(frames_dir)
+        if f.lower().endswith((".jpg", ".jpeg", ".png"))
+    ])
+    T = len(frame_paths)
     if T == 0:
-        return np.zeros((0, 0, 0, 0), dtype=bool), np.array([])
+        raise RuntimeError(f"帧目录无有效帧: {frames_dir}")
 
-    H, W = frames_bgr[0].shape[:2]
+    first = cv2.imread(frame_paths[0])
+    H, W = first.shape[:2]
     N_obj = len(object_names)
-    all_masks = np.zeros((N_obj, T, H, W), dtype=bool)
-
-    for t, frame_bgr in enumerate(frames_bgr):
-        pil_img = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-        state_base = sam3_processor.set_image(pil_img)
-
-        for i, obj_name in enumerate(object_names):
-            state = copy.copy(state_base)
-            state = sam3_processor.set_text_prompt(state=state, prompt=obj_name)
-
-            masks_t = state.get("masks")
-            scores_t = state.get("scores")
-
-            if masks_t is None or masks_t.shape[0] == 0:
-                continue
-
-            best_idx = int(scores_t.argmax())
-            score = float(scores_t[best_idx])
-            if score < SAM3_CONF:
-                continue
-
-            mask_np = masks_t[best_idx, 0].cpu().numpy().astype(np.uint8)
-            if mask_np.shape != (H, W):
-                mask_np = cv2.resize(mask_np, (W, H), interpolation=cv2.INTER_NEAREST)
-            all_masks[i, t] = mask_np.astype(bool)
-
-        if (t + 1) % 10 == 0 or t == T - 1:
-            print(f"  [SAM3] 帧 {t+1}/{T} 完成")
-
-    pixel_total = H * W
-    mean_areas = all_masks.sum(axis=(2, 3)).mean(axis=1) / pixel_total
-    return all_masks, mean_areas
-
-
-# ── masks → label_maps ────────────────────────────────────────────────────────
-
-def masks_to_label_maps(masks: np.ndarray) -> np.ndarray:
-    """
-    将 per-object masks (N_obj, T, H, W) bool 转换为 label_maps (T, H, W) int16。
-    优先级：object index 越小优先级越高（先出现的物体不被后出现的覆盖）。
-
-    0 = 背景，1~K = 物体类别（对应 object_names[class_id - 1]）
-    """
-    N_obj, T, H, W = masks.shape
     label_maps = np.zeros((T, H, W), dtype=np.int16)
-    for i in range(N_obj - 1, -1, -1):  # 逆序，低 index 优先
-        label_maps[masks[i]] = i + 1
-    return label_maps
+
+    resp = predictor.handle_request(dict(type="start_session", resource_path=frames_dir))
+    sid = resp["session_id"]
+
+    for cidx, concept in enumerate(object_names, start=1):
+        print(f"  [SAM3-Video] concept [{cidx}/{N_obj}]: {concept!r}", flush=True)
+        predictor.handle_request(dict(type="reset_session", session_id=sid))
+        predictor.handle_request(dict(
+            type="add_prompt", session_id=sid, frame_index=0, text=concept,
+        ))
+        pfo = {}
+        for r in predictor.handle_stream_request(
+            dict(type="propagate_in_video", session_id=sid)
+        ):
+            pfo[r["frame_index"]] = r["outputs"]
+
+        for t in range(T):
+            out = pfo.get(t)
+            if out is None:
+                continue
+            for _oid, mask_t in zip(out.get("out_obj_ids", []),
+                                    out.get("out_binary_masks", [])):
+                if isinstance(mask_t, torch.Tensor):
+                    mask_np = mask_t.cpu().numpy()
+                else:
+                    mask_np = np.asarray(mask_t)
+                mask_np = mask_np.squeeze()
+                if mask_np.ndim == 0:
+                    continue
+                if mask_np.ndim == 3:
+                    mask_np = mask_np[0]
+                mask_np = mask_np.astype(bool)
+                if mask_np.shape != (H, W):
+                    mask_np = cv2.resize(
+                        mask_np.astype(np.uint8), (W, H),
+                        interpolation=cv2.INTER_NEAREST,
+                    ).astype(bool)
+                free = label_maps[t] == 0
+                label_maps[t][free & mask_np] = cidx
+
+    predictor.handle_request(dict(type="close_session", session_id=sid))
+
+    # 从 label_maps 反推 per-object masks，兼容原有输出格式
+    masks = np.zeros((N_obj, T, H, W), dtype=bool)
+    for i in range(N_obj):
+        masks[i] = (label_maps == i + 1)
+
+    cov = (label_maps > 0).mean()
+    print(f"  [SAM3-Video] 完成  coverage={cov:.1%}", flush=True)
+    return label_maps, masks
+
+
+# ── masks → mean_areas ────────────────────────────────────────────────────────
+
+def _compute_mean_areas(masks: np.ndarray) -> np.ndarray:
+    """masks (N_obj, T, H, W) bool → mean_areas (N_obj,) float"""
+    if masks.shape[0] == 0:
+        return np.array([])
+    N_obj, T, H, W = masks.shape
+    pixel_total = H * W
+    return masks.sum(axis=(2, 3)).mean(axis=1) / pixel_total
 
 
 # ── 单条处理 ─────────────────────────────────────────────────────────────────
 
-def _process_one(entry: dict, qwen_model, qwen_processor, sam3_processor, qwen_device: str,
-                 sam3_device: str = "cuda:0") -> None:
+def _process_one(
+    entry: dict,
+    qwen_model,
+    qwen_processor,
+    predictor,
+    qwen_device: str,
+    sam3_gpu: int,
+    tmp_root: str,
+) -> None:
     """处理 batch_manifest 中的一条记录。"""
     video_path  = entry["video_path"]
     out_masks   = Path(entry["output_masks_npz"])
@@ -247,13 +281,23 @@ def _process_one(entry: dict, qwen_model, qwen_processor, sam3_processor, qwen_d
     for p in [out_masks.parent, out_objects.parent, out_labels.parent]:
         p.mkdir(parents=True, exist_ok=True)
 
-    frames_bgr = _extract_frames_bgr(video_path, max_frames)
-    T = len(frames_bgr)
-    if T == 0:
+    # 提取帧到磁盘（视频预测器需要帧目录）
+    frames_dir = os.path.join(tmp_root, Path(video_path).stem + "_frames")
+    n_frames = _extract_frames_to_dir(video_path, frames_dir, max_frames)
+    if n_frames == 0:
         raise RuntimeError(f"视频无有效帧: {video_path}")
-    H, W = frames_bgr[0].shape[:2]
-    print(f"  抽帧: {T} 帧  分辨率: {H}×{W}")
 
+    first_frame_path = sorted([
+        os.path.join(frames_dir, f)
+        for f in os.listdir(frames_dir)
+        if f.lower().endswith((".jpg", ".jpeg", ".png"))
+    ])[0]
+    first_bgr = cv2.imread(first_frame_path)
+    H, W = first_bgr.shape[:2]
+    T = n_frames
+    print(f"  帧数: {T}  分辨率: {H}×{W}")
+
+    # 物体识别
     if ref_objects is not None and Path(ref_objects).exists():
         with open(ref_objects, "r") as f:
             obj_data = json.load(f)
@@ -263,7 +307,9 @@ def _process_one(entry: dict, qwen_model, qwen_processor, sam3_processor, qwen_d
             object_names = obj_data
         print(f"  [物体列表] 复用 {Path(ref_objects).name}: {object_names}")
     else:
-        object_names = _identify_objects(frames_bgr[0], qwen_device, qwen_model, qwen_processor)
+        object_names = _identify_objects(
+            first_frame_path, qwen_device, qwen_model, qwen_processor,
+        )
 
     if not object_names:
         print(f"  [警告] 未识别到物体，保存空 masks")
@@ -282,7 +328,8 @@ def _process_one(entry: dict, qwen_model, qwen_processor, sam3_processor, qwen_d
         json.dump({"objects": object_names, "video": video_path}, f,
                   ensure_ascii=False, indent=2)
 
-    masks, mean_areas = _segment_video(frames_bgr, object_names, sam3_processor, device=sam3_device)
+    label_maps, masks = _track_video(frames_dir, object_names, predictor, sam3_gpu)
+    mean_areas = _compute_mean_areas(masks)
 
     np.savez_compressed(
         str(out_masks),
@@ -291,7 +338,6 @@ def _process_one(entry: dict, qwen_model, qwen_processor, sam3_processor, qwen_d
         mean_areas=mean_areas,
     )
 
-    label_maps = masks_to_label_maps(masks)
     np.savez_compressed(
         str(out_labels),
         label_maps=label_maps,
@@ -305,19 +351,18 @@ def _process_one(entry: dict, qwen_model, qwen_processor, sam3_processor, qwen_d
 # ── 主函数 ───────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="SAM3 batch segmentation worker")
+    parser = argparse.ArgumentParser(description="SAM3 batch segmentation worker (video mode)")
     parser.add_argument("--batch_manifest", required=True, help="batch manifest JSON path")
     parser.add_argument("--sam3_gpu",  type=int, default=0)
     parser.add_argument("--qwen_gpu",  type=int, default=0)
     args = parser.parse_args()
 
-    import gc
-
     with open(args.batch_manifest, "r") as f:
         entries = json.load(f)
 
-    print(f"[worker_sam3] total {len(entries)} videos")
+    print(f"[worker_sam3] total {len(entries)} videos  (video-tracking mode)")
 
+    # ── Pass 1: Qwen 物体识别（仅 GT 视频）─────────────────────────────────
     need_qwen_entries = [e for e in entries
                          if not e.get("ref_objects_json") or
                          not Path(e.get("ref_objects_json", "")).exists()]
@@ -332,29 +377,38 @@ def main():
         ).to(f"cuda:{args.qwen_gpu}").eval()
         print(f"[worker_sam3] Qwen3-VL loaded")
 
-        for entry in need_qwen_entries:
-            out_objects = Path(entry["output_objects_json"])
-            if out_objects.exists() and out_objects.stat().st_size > 64:
-                print(f"  [skip] objects already exist: {out_objects.name}")
-                continue
-            try:
-                frames_bgr = _extract_frames_bgr(entry["video_path"],
-                                                 entry.get("max_frames", 0))
-                object_names = (
-                    _identify_objects(frames_bgr[0], f"cuda:{args.qwen_gpu}",
-                                      qwen_model, qwen_processor)
-                    if frames_bgr else []
-                )
-            except Exception as exc:
-                import traceback
-                print(f"  [error] Qwen failed for {Path(entry['video_path']).name}: {exc}")
-                traceback.print_exc()
-                object_names = []
-            out_objects.parent.mkdir(parents=True, exist_ok=True)
-            with open(str(out_objects), "w") as f:
-                json.dump({"objects": object_names, "video": entry["video_path"]},
-                          f, ensure_ascii=False, indent=2)
-            print(f"  Qwen done: {out_objects.name}  objects={object_names}")
+        with tempfile.TemporaryDirectory(prefix="worker_sam3_qwen_") as tmp_root:
+            for entry in need_qwen_entries:
+                out_objects = Path(entry["output_objects_json"])
+                if out_objects.exists() and out_objects.stat().st_size > 64:
+                    print(f"  [skip] objects already exist: {out_objects.name}")
+                    continue
+                try:
+                    frames_dir = os.path.join(tmp_root,
+                                              Path(entry["video_path"]).stem + "_frames")
+                    n = _extract_frames_to_dir(entry["video_path"], frames_dir,
+                                               entry.get("max_frames", 0))
+                    if n == 0:
+                        raise RuntimeError("no frames extracted")
+                    first_frame = sorted([
+                        os.path.join(frames_dir, f)
+                        for f in os.listdir(frames_dir)
+                        if f.lower().endswith((".jpg", ".jpeg", ".png"))
+                    ])[0]
+                    object_names = _identify_objects(
+                        first_frame, f"cuda:{args.qwen_gpu}",
+                        qwen_model, qwen_processor,
+                    )
+                except Exception as exc:
+                    import traceback
+                    print(f"  [error] Qwen failed for {Path(entry['video_path']).name}: {exc}")
+                    traceback.print_exc()
+                    object_names = []
+                out_objects.parent.mkdir(parents=True, exist_ok=True)
+                with open(str(out_objects), "w") as f:
+                    json.dump({"objects": object_names, "video": entry["video_path"]},
+                              f, ensure_ascii=False, indent=2)
+                print(f"  Qwen done: {out_objects.name}  objects={object_names}")
 
         del qwen_model, qwen_processor
         gc.collect()
@@ -362,46 +416,49 @@ def main():
         print("[worker_sam3] Qwen unloaded, VRAM released")
     else:
         print("[worker_sam3] Pass 1: skipped (all entries have ref_objects_json)")
+        qwen_model = qwen_processor = None
 
+    # ref_objects_json が未解決のエントリを自分の objects_json に向ける
     for e in entries:
         if not e.get("ref_objects_json") or \
                 not Path(e.get("ref_objects_json", "")).exists():
             e["ref_objects_json"] = e["output_objects_json"]
 
-    print(f"\n[worker_sam3] Pass 2: SAM3 segmentation  device=cuda:{args.sam3_gpu}")
-    from sam3.model_builder import build_sam3_image_model
-    from sam3.model.sam3_image_processor import Sam3Processor
+    # ── Pass 2: SAM3 视频追踪 ─────────────────────────────────────────────
+    print(f"\n[worker_sam3] Pass 2: SAM3 video tracking  device=cuda:{args.sam3_gpu}")
+    from sam3.model_builder import build_sam3_video_predictor
 
-    sam3_model = build_sam3_image_model(
-        bpe_path=SAM3_BPE,
-        device=f"cuda:{args.sam3_gpu}",
-        eval_mode=True,
+    predictor = build_sam3_video_predictor(
         checkpoint_path=SAM3_CKPT,
-        load_from_HF=False,
-        enable_segmentation=True,
-        enable_inst_interactivity=False,
-        compile=False,
-    ).to(f"cuda:{args.sam3_gpu}").eval()
-    sam3_processor = Sam3Processor(sam3_model, device=f"cuda:{args.sam3_gpu}",
-                                   confidence_threshold=SAM3_CONF)
-    print(f"[worker_sam3] SAM3 loaded")
+        bpe_path=SAM3_BPE,
+        gpus_to_use=[args.sam3_gpu],
+    )
+    print(f"[worker_sam3] SAM3 video predictor loaded")
 
     n_ok, n_err = 0, 0
-    for i, entry in enumerate(entries):
-        print(f"\n{'='*55}")
-        print(f"[{i+1}/{len(entries)}] {Path(entry['video_path']).name}")
-        try:
-            _process_one(entry, None, None, sam3_processor,
-                         qwen_device=f"cuda:{args.qwen_gpu}",
-                         sam3_device=f"cuda:{args.sam3_gpu}")
-            n_ok += 1
-        except Exception as e:
-            import traceback
-            print(f"  [error] {e}")
-            traceback.print_exc()
-            n_err += 1
+    with tempfile.TemporaryDirectory(prefix="worker_sam3_frames_") as tmp_root:
+        for i, entry in enumerate(entries):
+            print(f"\n{'='*55}")
+            print(f"[{i+1}/{len(entries)}] {Path(entry['video_path']).name}")
+            try:
+                _process_one(
+                    entry,
+                    qwen_model=None,
+                    qwen_processor=None,
+                    predictor=predictor,
+                    qwen_device=f"cuda:{args.qwen_gpu}",
+                    sam3_gpu=args.sam3_gpu,
+                    tmp_root=tmp_root,
+                )
+                n_ok += 1
+            except Exception as e:
+                import traceback
+                print(f"  [error] {e}")
+                traceback.print_exc()
+                n_err += 1
 
-    del sam3_model, sam3_processor
+    predictor.shutdown()
+    gc.collect()
     torch.cuda.empty_cache()
 
     print(f"\n[worker_sam3] done: ok={n_ok}  err={n_err}")

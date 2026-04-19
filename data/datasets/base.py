@@ -8,7 +8,7 @@ Resolution is left at original — resize/crop is handled by the converter.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image
@@ -28,6 +28,7 @@ class RawSample:
     dataset: str                      # "re10k", "dl3dv", etc.
     orig_id: str = ""                 # original identifier in the raw dataset
     depths: Optional[np.ndarray] = None   # (N, H, W) float32 in meters, if available
+    extra: Optional[Dict[str, Any]] = None  # free-form per-sample metadata for writers
 
 
 # ═══════════════════════ Shared Geometry Utilities ═══════════════════════

@@ -268,7 +268,7 @@ def _evaluate_core(
             pred_c2w[:, :3, :], c2w_n, pred_depth)
         scaled_depth = np.clip(scaled_depth, 1e-3, depth_cap)
         pred_pc = depth_to_pointcloud(
-            scaled_depth, K_n, aligned_c2w,
+            scaled_depth, pred_intr, aligned_c2w,
             conf=pred_conf, conf_thresh=conf_thresh, depth_max=depth_cap)
         gt_pc = depth_to_pointcloud(gt_depth_n, K_n, c2w_n, depth_max=depth_cap)
         extra["depth_scale"] = s
@@ -277,7 +277,7 @@ def _evaluate_core(
         _, _, s = umeyama_align(pred_c2w[:, :3, 3], _to_4x4(c2w_n)[:, :3, 3])
         pred_depth_scaled = np.clip(pred_depth * s, 1e-3, depth_cap)
         pred_pc = depth_to_pointcloud(
-            pred_depth_scaled, K_n, c2w_n,
+            pred_depth_scaled, pred_intr, c2w_n,
             conf=pred_conf, conf_thresh=conf_thresh, depth_max=depth_cap)
         gt_pc = depth_to_pointcloud(gt_depth_n, K_n, c2w_n, depth_max=depth_cap)
         extra["depth_scale"] = s
@@ -322,7 +322,25 @@ def _evaluate_core(
     return metrics
 
 
-# ═══════════════ 三个公开接口 ══════════════════════════════════
+# ═══════════════ 四种对齐模式说明 ══════════════════════════════
+#
+#  camera      — Umeyama 对齐相机位置求 scale → 用 pred 内参 + GT 外参重投影
+#                （假设坐标系方向一致，只修正尺度）
+#  first_frame — 首帧 pose 对齐 + 轨迹长度求 scale → 用 pred 内参 + 对齐后外参重投影
+#                （最接近 RL 训练 reward 的对齐方式）
+#  umeyama     — 各用自己相机参数重投影 → Umeyama 相似变换对齐点云
+#                （无坐标系假设，允许旋转+缩放）
+#  icp         — umeyama 对齐后再做 ICP 精化（最精确，耗时最长）
+#
+#  组合快捷：
+#  both_align  — 同时运行 camera + first_frame（默认推荐）
+#  all_align   — 同时运行全部四种模式
+
+# ═══════════════ 公开接口 ════════════════════════════════════════
+
+ALL_ALIGN_MODES = ("camera", "first_frame", "umeyama", "icp")
+VALID_ALIGN_CHOICES = ("camera", "first_frame", "umeyama", "icp",
+                       "both_align", "all_align")
 
 
 def evaluate_global(
@@ -331,29 +349,51 @@ def evaluate_global(
     align: str = "camera", n_fps: int = 20000,
     conf_thresh: float = 0.0, device: str = "cpu",
 ) -> dict:
-    """单一对齐模式评估。"""
+    """单一对齐模式评估。align 须为四种基础模式之一。"""
+    assert align in ALL_ALIGN_MODES, \
+        f"align 须为 {ALL_ALIGN_MODES} 之一，组合模式请用 evaluate_global_multi"
     return _evaluate_core(
         pred_npz, gt_depth, K, c2w, align, n_fps, conf_thresh,
         icp_max_iter=50, icp_inlier_ratio=0.9, device=device)
 
 
+def evaluate_global_multi(
+    pred_npz: str, gt_depth: np.ndarray,
+    K: np.ndarray, c2w: np.ndarray,
+    aligns: tuple = ("camera", "first_frame"),
+    n_fps: int = 20000, conf_thresh: float = 0.0, device: str = "cpu",
+) -> dict:
+    """同时运行多种对齐模式，返回 {align_name: result} 字典。"""
+    return {
+        mode: _evaluate_core(
+            pred_npz, gt_depth, K, c2w, mode, n_fps, conf_thresh,
+            icp_max_iter=50, icp_inlier_ratio=0.9, device=device)
+        for mode in aligns
+    }
+
+
 def evaluate_global_both(
     pred_npz: str, gt_depth: np.ndarray,
     K: np.ndarray, c2w: np.ndarray,
-    existing_align: str = "camera", n_fps: int = 20000,
-    conf_thresh: float = 0.0, device: str = "cpu",
+    n_fps: int = 20000, conf_thresh: float = 0.0, device: str = "cpu",
 ) -> dict:
-    """同时运行现有模式 + 首帧对齐模式。"""
-    result_existing = _evaluate_core(
-        pred_npz, gt_depth, K, c2w, existing_align, n_fps, conf_thresh,
-        icp_max_iter=50, icp_inlier_ratio=0.9, device=device)
-    result_ff = _evaluate_core(
-        pred_npz, gt_depth, K, c2w, "first_frame", n_fps, conf_thresh,
-        icp_max_iter=50, icp_inlier_ratio=0.9, device=device)
-    return {
-        existing_align: result_existing,
-        "first_frame": result_ff,
-    }
+    """同时运行 camera + first_frame 两种模式。"""
+    return evaluate_global_multi(
+        pred_npz, gt_depth, K, c2w,
+        aligns=("camera", "first_frame"),
+        n_fps=n_fps, conf_thresh=conf_thresh, device=device)
+
+
+def evaluate_global_all_align(
+    pred_npz: str, gt_depth: np.ndarray,
+    K: np.ndarray, c2w: np.ndarray,
+    n_fps: int = 20000, conf_thresh: float = 0.0, device: str = "cpu",
+) -> dict:
+    """同时运行全部四种对齐模式：camera / first_frame / umeyama / icp。"""
+    return evaluate_global_multi(
+        pred_npz, gt_depth, K, c2w,
+        aligns=ALL_ALIGN_MODES,
+        n_fps=n_fps, conf_thresh=conf_thresh, device=device)
 
 
 def evaluate_global_firstframe_only(

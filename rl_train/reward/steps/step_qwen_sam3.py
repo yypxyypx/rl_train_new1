@@ -1,11 +1,11 @@
 """
-Step: Qwen-VL + SAM3 Semantic Segmentation
-============================================
+Step: Qwen-VL + SAM3 Semantic Segmentation (Video Mode)
+========================================================
 Conda env: SAM3
 
 对视频帧进行语义分割：
   1. Qwen3-VL 识别首帧物体
-  2. SAM3 逐帧分割所有物体
+  2. SAM3 视频追踪模式（propagate_in_video）分割所有物体
   3. 输出 label_maps.npz (T, H, W) int16
 
 Usage:
@@ -17,7 +17,6 @@ Usage:
 """
 
 import argparse
-import copy
 import gc
 import json
 import os
@@ -27,7 +26,6 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
-from PIL import Image
 
 _REWARD_DIR = Path(__file__).resolve().parent.parent
 _RL_TRAIN_DIR = _REWARD_DIR.parent
@@ -52,6 +50,7 @@ SAM3_CONF = 0.5
 
 def identify_objects(first_frame_path: str, device: str) -> list:
     """用 Qwen3-VL 识别首帧中的显著物体，返回物体名称列表。"""
+    from PIL import Image
     from transformers import AutoProcessor, AutoModelForImageTextToText
 
     processor = AutoProcessor.from_pretrained(QWEN_MODEL, trust_remote_code=True)
@@ -135,74 +134,92 @@ def identify_objects(first_frame_path: str, device: str) -> list:
     return objs
 
 
-# ═══════════════════════ SAM3 Segmentation ═══════════════════════
+# ═══════════════════════ SAM3 Video Segmentation ═══════════════════════
 
 
-def segment_frames(
-    frame_paths: list, object_names: list, device: str,
+def segment_frames_video(
+    frames_dir: str, object_names: list, device: str,
 ) -> tuple:
     """
-    SAM3 逐帧分割，返回 (masks, label_maps)。
+    SAM3 视频追踪模式分割，返回 (masks, label_maps)。
+
+    使用 propagate_in_video 跨帧追踪，效果比逐帧分割更稳定。
 
     masks      : (N_obj, T, H, W) bool
     label_maps : (T, H, W) int16
     """
-    from sam3.model_builder import build_sam3_image_model
-    from sam3.model.sam3_image_processor import Sam3Processor
+    from sam3.model_builder import build_sam3_video_predictor
 
-    sam3_model = build_sam3_image_model(
-        bpe_path=SAM3_BPE,
-        device=device,
-        eval_mode=True,
-        checkpoint_path=SAM3_CKPT,
-        load_from_HF=False,
-        enable_segmentation=True,
-        enable_inst_interactivity=False,
-        compile=False,
-    ).to(device).eval()
-    sam3_processor = Sam3Processor(sam3_model, device=device,
-                                   confidence_threshold=SAM3_CONF)
+    gpu_idx = int(device.split(":")[-1]) if ":" in device else 0
 
+    frame_paths = sorted([
+        os.path.join(frames_dir, f)
+        for f in os.listdir(frames_dir)
+        if f.lower().endswith((".jpg", ".jpeg", ".png"))
+    ])
     T = len(frame_paths)
-    first_img = Image.open(frame_paths[0]).convert("RGB")
-    W, H = first_img.size
+    first = cv2.imread(frame_paths[0])
+    H, W = first.shape[:2]
     N_obj = len(object_names)
-    all_masks = np.zeros((N_obj, T, H, W), dtype=bool)
-
-    for t, fp in enumerate(frame_paths):
-        pil_img = Image.open(fp).convert("RGB")
-        state_base = sam3_processor.set_image(pil_img)
-
-        for i, obj_name in enumerate(object_names):
-            state = copy.copy(state_base)
-            state = sam3_processor.set_text_prompt(state=state, prompt=obj_name)
-
-            masks_t = state.get("masks")
-            scores_t = state.get("scores")
-
-            if masks_t is None or masks_t.shape[0] == 0:
-                continue
-
-            best_idx = int(scores_t.argmax())
-            score = float(scores_t[best_idx])
-            if score < SAM3_CONF:
-                continue
-
-            mask_np = masks_t[best_idx, 0].cpu().numpy().astype(np.uint8)
-            if mask_np.shape != (H, W):
-                mask_np = cv2.resize(mask_np, (W, H), interpolation=cv2.INTER_NEAREST)
-            all_masks[i, t] = mask_np.astype(bool)
-
-        if (t + 1) % 10 == 0 or t == T - 1:
-            print(f"[SAM3] 帧 {t+1}/{T} 完成")
 
     label_maps = np.zeros((T, H, W), dtype=np.int16)
-    for i in range(N_obj - 1, -1, -1):
-        label_maps[all_masks[i]] = i + 1
 
-    del sam3_model, sam3_processor
+    predictor = build_sam3_video_predictor(
+        checkpoint_path=SAM3_CKPT,
+        bpe_path=SAM3_BPE,
+        gpus_to_use=[gpu_idx],
+    )
+    resp = predictor.handle_request(dict(type="start_session", resource_path=frames_dir))
+    sid = resp["session_id"]
+
+    for cidx, concept in enumerate(object_names, start=1):
+        print(f"[SAM3-Video] concept [{cidx}/{N_obj}]: {concept!r}", flush=True)
+        predictor.handle_request(dict(type="reset_session", session_id=sid))
+        predictor.handle_request(dict(
+            type="add_prompt", session_id=sid, frame_index=0, text=concept,
+        ))
+        pfo = {}
+        for r in predictor.handle_stream_request(
+            dict(type="propagate_in_video", session_id=sid)
+        ):
+            pfo[r["frame_index"]] = r["outputs"]
+
+        for t in range(T):
+            out = pfo.get(t)
+            if out is None:
+                continue
+            for _oid, mask_t in zip(out.get("out_obj_ids", []),
+                                    out.get("out_binary_masks", [])):
+                if isinstance(mask_t, torch.Tensor):
+                    mask_np = mask_t.cpu().numpy()
+                else:
+                    mask_np = np.asarray(mask_t)
+                mask_np = mask_np.squeeze()
+                if mask_np.ndim == 0:
+                    continue
+                if mask_np.ndim == 3:
+                    mask_np = mask_np[0]
+                mask_np = mask_np.astype(bool)
+                if mask_np.shape != (H, W):
+                    mask_np = cv2.resize(
+                        mask_np.astype(np.uint8), (W, H),
+                        interpolation=cv2.INTER_NEAREST,
+                    ).astype(bool)
+                free = label_maps[t] == 0
+                label_maps[t][free & mask_np] = cidx
+
+    predictor.handle_request(dict(type="close_session", session_id=sid))
+    predictor.shutdown()
     gc.collect()
     torch.cuda.empty_cache()
+
+    cov = (label_maps > 0).mean()
+    print(f"[SAM3-Video] 完成  coverage={cov:.1%}", flush=True)
+
+    # 从 label_maps 反推 per-object masks，供 filter_unstable_masks 使用
+    all_masks = np.zeros((N_obj, T, H, W), dtype=bool)
+    for i in range(N_obj):
+        all_masks[i] = (label_maps == i + 1)
 
     return all_masks, label_maps
 
@@ -253,15 +270,28 @@ def main():
     if not object_names:
         print("[step_qwen_sam3] 未识别到物体，保存空 label_maps")
         T = len(frame_paths)
-        first_img = Image.open(frame_paths[0]).convert("RGB")
-        W, H = first_img.size
+        first_bgr = cv2.imread(frame_paths[0])
+        H, W = first_bgr.shape[:2]
         os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
         np.savez_compressed(args.output,
                             label_maps=np.zeros((T, H, W), dtype=np.int16),
                             object_names=np.array([], dtype=object))
         return
 
-    masks, label_maps = segment_frames(frame_paths, object_names, device)
+    masks, label_maps = segment_frames_video(args.video_frames_dir, object_names, device)
+
+    sys.path.insert(0, str(_REWARD_DIR))
+    from reward_metrics import filter_unstable_masks
+    filtered_masks, removed = filter_unstable_masks(masks, object_names=object_names)
+    if removed:
+        print(f"[step_qwen_sam3] Filtered {len(removed)} unstable objects:")
+        for idx, name, reason, areas in removed:
+            print(f"  - {name} (#{idx}): {reason}")
+        T, H, W = label_maps.shape
+        label_maps = np.zeros((T, H, W), dtype=np.int16)
+        for i in range(len(object_names) - 1, -1, -1):
+            label_maps[filtered_masks[i]] = i + 1
+        masks = filtered_masks
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     np.savez_compressed(
