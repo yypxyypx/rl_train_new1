@@ -24,6 +24,7 @@ compare_mode:
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -562,6 +563,157 @@ def parse_camera_txt(path: str, H: int, W: int):
 # ==================== Aggregate ====================
 
 
+def _featup_upsample_patch_tokens(
+    patch_features: torch.Tensor,
+    frames_dir: str,
+    H_model: int,
+    W_model: int,
+    device: str,
+) -> torch.Tensor:
+    """把 patch tokens 上采样到 pixel-level (H_model, W_model)，用 FeatUp JBU。
+
+    完全离线：
+      - JBU 模型结构：从 third_party/repos/FeatUp 本地代码搭起来
+      - JBU ckpt    ：从 model/featup/dinov2_jbu_stack_cocostuff.ckpt 直接 torch.load
+      - 不走 torch.hub URL 下载，不依赖任何 cache 路径
+
+    无 fallback：FeatUp ckpt / 仓库代码缺失会直接抛错，避免悄悄退化为 bilinear。
+
+    Args:
+        patch_features: [N, C, H_feat, W_feat] on `device`
+        frames_dir    : 原始帧目录，FeatUp 需要原图作为 joint bilateral guidance
+        H_model/W_model: 目标 pixel-level 分辨率（必须能被 14 整除）
+
+    Returns:
+        [N, C, H_model, W_model] on `device`，dtype 与输入一致
+    """
+    import torchvision.transforms as T
+    from PIL import Image
+    from pathlib import Path as _P
+
+    N, C, H_feat, W_feat = patch_features.shape
+
+    _rl_code_dir = _P(__file__).resolve().parent.parent.parent
+    _model_root = _P(os.environ.get("RL_MODEL_ROOT", str(_rl_code_dir / "model")))
+    _featup_repo = _rl_code_dir / "third_party" / "repos" / "FeatUp"
+    _featup_ckpt = _model_root / "featup" / "dinov2_jbu_stack_cocostuff.ckpt"
+    _dinov2_repo = _model_root / "dinov2_repo"
+
+    if not _featup_ckpt.is_file():
+        raise FileNotFoundError(
+            f"FeatUp JBU ckpt not found: {_featup_ckpt}\n"
+            f"Expected ~2MB ckpt at this path. Download from "
+            f"https://marhamilresearch4.blob.core.windows.net/feature-upsampling-public/"
+            f"pretrained/dinov2_jbu_stack_cocostuff.ckpt"
+        )
+    if not _featup_repo.is_dir() or not (_featup_repo / "featup").is_dir():
+        raise FileNotFoundError(
+            f"FeatUp repo not found: {_featup_repo}\n"
+            f"Expected a clone of github.com/mhamilton723/FeatUp at this path."
+        )
+
+    # 已经在本进程加载过的话直接复用
+    global _FEATUP_UPSAMPLER_CACHE
+    try:
+        _FEATUP_UPSAMPLER_CACHE
+    except NameError:
+        _FEATUP_UPSAMPLER_CACHE = {}
+
+    cache_key = (str(_featup_ckpt), str(device))
+    upsampler = _FEATUP_UPSAMPLER_CACHE.get(cache_key)
+    if upsampler is None:
+        # 把 FeatUp 仓库加到 sys.path（不走 torch.hub），直接构建 UpsampledBackbone 然后只
+        # 取它的 upsampler 子模块（我们不需要 FeatUp 内部的 dinov2 backbone，因为
+        # 我们已经在 step_dinov2_extract 里跑过 dinov2 拿到了 patch tokens）。
+        if str(_featup_repo) not in sys.path:
+            sys.path.insert(0, str(_featup_repo))
+
+        # 同时确保本地 dinov2 repo 在 path（FeatUp 内部 dinov2 backbone 构建时会触发
+        # torch.hub.load("facebookresearch/dinov2", ...) 走在线下载；而 hubconf.py 的
+        # _load_backbone 也会去下载 ckpt url。我们绕过这两步：手动构造 upsampler。）
+        from featup.upsamplers import get_upsampler  # noqa: E402
+
+        print(f"[FeatUp] Building JBU stack from {_featup_repo}")
+        # JBU stack 的输入维度 = DINOv2 ViT-S/14 dim = 384
+        upsampler = get_upsampler("jbu_stack", C).to(device).eval()
+
+        print(f"[FeatUp] Loading ckpt {_featup_ckpt}")
+        ckpt = torch.load(str(_featup_ckpt), map_location="cpu", weights_only=False)
+        full_state = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
+
+        # ckpt 的 state_dict 里 keys 形如 "upsampler.up1.range_temp"、"model.0...","scale_net..." 等。
+        # 我们只取 "upsampler." 前缀的键。
+        upsampler_state = {
+            k[len("upsampler."):]: v
+            for k, v in full_state.items()
+            if k.startswith("upsampler.")
+            and "scale_net" not in k
+            and "downsampler" not in k
+        }
+        missing, unexpected = upsampler.load_state_dict(upsampler_state, strict=False)
+        if missing:
+            print(f"[FeatUp] WARN missing keys ({len(missing)}): {missing[:3]}...")
+        if unexpected:
+            print(f"[FeatUp] WARN unexpected keys ({len(unexpected)}): {unexpected[:3]}...")
+
+        for p in upsampler.parameters():
+            p.requires_grad = False
+        _FEATUP_UPSAMPLER_CACHE[cache_key] = upsampler
+
+    # 读图作为 JBU guidance（与 step_dinov2_extract 同一 normalize 协议）
+    IMAGENET_MEAN = [0.485, 0.456, 0.406]
+    IMAGENET_STD = [0.229, 0.224, 0.225]
+    normalize = T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+
+    frame_paths = sorted([
+        str(p) for p in _P(frames_dir).iterdir()
+        if p.suffix.lower() in (".png", ".jpg", ".jpeg")
+    ])
+    if len(frame_paths) != N:
+        raise RuntimeError(
+            f"frames_dir image count {len(frame_paths)} != patch_features N {N}"
+        )
+
+    # FeatUp JBU stack 严格 4 层 × 2× = 16× 上采样（FeatUp/featup/upsamplers.py:271-276）。
+    # patches (Hf, Wf) → 输出 (Hf*16, Wf*16)；guidance 图分辨率不影响输出形状。
+    # 因此当 (H_model, W_model) 不是 (Hf*16, Wf*16) 时，需要做一次 bilinear 调整。
+    # 这是 MEt3R 自己的官方做法（met3r/met3r.py:_interpolate）：
+    #   ```
+    #   feat = self.upsampler_model(inp1, inp2)
+    #   # Important for specific backbone which may not return with correct dimensions
+    #   feat = F.interpolate(feat, (inp2.shape[-2:]), mode="bilinear")
+    #   ```
+    # 这一步只是「最后一公里的尺寸对齐」，不会破坏 FeatUp 在物体边缘上学到的特征对齐能力
+    # （JBU 内部已经做完边缘 awareness 的上采样）。
+    feat_out_h, feat_out_w = H_feat * 16, W_feat * 16
+    need_resize = (feat_out_h != H_model) or (feat_out_w != W_model)
+    if need_resize:
+        print(f"[FeatUp] JBU native output {H_feat}x{W_feat}*16={feat_out_h}x{feat_out_w}, "
+              f"will resize -> {H_model}x{W_model} (à la met3r._interpolate)")
+
+    out = torch.empty(
+        (N, C, H_model, W_model),
+        dtype=patch_features.dtype, device=device,
+    )
+    for i, fp in enumerate(frame_paths):
+        # guidance image 任意尺寸都行（JBU 内部 adaptive_avg_pool 到匹配 source 的 2x）；
+        # 用目标 H_model x W_model 喂进去最对口
+        img = Image.open(fp).convert("RGB").resize((W_model, H_model), Image.BILINEAR)
+        guide = T.ToTensor()(img).unsqueeze(0).to(device)
+        guide = normalize(guide)
+        with torch.no_grad():
+            up = upsampler(
+                patch_features[i:i + 1].to(torch.float32),
+                guide.to(torch.float32),
+            )  # [1, C, feat_out_h, feat_out_w]
+            if need_resize:
+                up = F.interpolate(up, size=(H_model, W_model),
+                                   mode="bilinear", align_corners=False)
+        out[i] = up.squeeze(0).to(patch_features.dtype)
+    print(f"[FeatUp] Upsampled {N} frames patch{H_feat}x{W_feat} -> pixel{H_model}x{W_model}")
+    return out
+
+
 def _compute_feature_sim_from_npz(
     dinov2_features_path: str,
     da3_data: dict,
@@ -571,23 +723,44 @@ def _compute_feature_sim_from_npz(
 ) -> tuple:
     """利用 dinov2_features.npz + da3_data 计算 warping cosine similarity。
 
-    等价于旧 step_dinov2_featup.py 的计算逻辑，但输入来自分离的 npz 文件，
-    使得特征提取可以与 DA3 完全并行。
+    支持两种 npz 格式：
+      - **patch_tokens (new)**: features shape = [N, C, H_patch, W_patch] (~96MB)。
+        会在 GPU 上现场用 FeatUp / bilinear 上采样到 pixel-level (H_model, W_model)。
+      - **legacy**: features shape = [N, C, H_model, W_model] (~11GB pixel-level)。
+        直接进入 warping。向后兼容旧产物。
 
     Returns:
         (reward_feature_sim: float, details: dict)
     """
     npz = np.load(dinov2_features_path, allow_pickle=True)
-    # 加载为 fp16 直接搬 GPU（[49,384,560,560] fp16 ≈ 5.9 GB；fp32 会爆到 11.8 GB）。
-    # warping/grid_sample 在 fp16 上数值稳定（cosine similarity 用 dim=1 归一化）。
     raw = npz["features"]
     if raw.dtype == np.float16:
-        features = torch.from_numpy(raw).to(device)  # [N,C,Hf,Wf] fp16
+        features = torch.from_numpy(raw).to(device)
     else:
         features = torch.from_numpy(raw).to(device).to(torch.float16)
-    H_feat = int(npz["H_feat"])
-    W_feat = int(npz["W_feat"])
+    H_feat_npz = int(npz["H_feat"])
+    W_feat_npz = int(npz["W_feat"])
     N = features.shape[0]
+
+    mode = str(npz["mode"]) if "mode" in npz.files else "legacy"
+    if mode == "patch_tokens":
+        # 新流程：把 patch tokens 上采样到 pixel-level，warping 与旧版相同
+        H_model = int(npz["H_model"])
+        W_model = int(npz["W_model"])
+        frames_dir = str(npz["frames_dir"]) if "frames_dir" in npz.files else ""
+        if not frames_dir or not os.path.isdir(frames_dir):
+            print(f"[FeatUp] frames_dir missing/invalid ({frames_dir!r}); using bilinear")
+            features = F.interpolate(
+                features, size=(H_model, W_model),
+                mode="bilinear", align_corners=False,
+            )
+        else:
+            features = _featup_upsample_patch_tokens(
+                features, frames_dir, H_model, W_model, device,
+            )
+        H_feat, W_feat = H_model, W_model
+    else:
+        H_feat, W_feat = H_feat_npz, W_feat_npz
 
     depth_all = torch.from_numpy(np.array(da3_data["depth"]).astype(np.float32)).to(device)
     w2c_all = torch.from_numpy(
@@ -641,21 +814,35 @@ def _compute_feature_sim_from_npz(
         return grid, valid.float().unsqueeze(0).unsqueeze(0)
 
     def _pair_score(src_f, ref_f, grid, mask):
-        # grid 是 fp32（来自 K^-1 投影计算），features 可能是 fp16。
-        # grid_sample 要求 input/grid 同 dtype，统一到 features.dtype。
+        """计算 src_f 在自身坐标系下，与从 ref_f 按 grid 采样过来的特征的 cosine 距离。
+
+        关键数值稳定性：
+          - features 经 FeatUp 上采样后是 fp16，某些边界 / 低响应像素的 norm
+            在 fp16 下会 underflow 到 0，cosine_similarity 会算出 0/0 = NaN。
+            **必须**升到 fp32 再做 normalize + dot 才安全。
+          - cosine_similarity 内置 eps=1e-8 在 fp16 下也是 0（fp16 最小正常数 6e-5）。
+            自己用 F.normalize(eps=1e-6) + dot 显式控制。
+          - 最后 nan_to_num 兜底极端情况（grid 全 NaN 时 grid_sample 输出 NaN）。
+        """
+        # grid_sample 要求 input/grid 同 dtype
         if grid.dtype != ref_f.dtype:
             grid = grid.to(ref_f.dtype)
         ref_s = torch.nn.functional.grid_sample(
             ref_f, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
-        cos = torch.nn.functional.cosine_similarity(src_f, ref_s, dim=1).squeeze()
-        score_map = 1.0 - cos
+        # ↓↓↓ fp32 cosine：避开 fp16 norm underflow 引起的 NaN ↓↓↓
+        src_n = torch.nn.functional.normalize(src_f.float(), dim=1, eps=1e-6)
+        ref_n = torch.nn.functional.normalize(ref_s.float(), dim=1, eps=1e-6)
+        cos = (src_n * ref_n).sum(dim=1).squeeze()
+        score_map = (1.0 - cos)
+        # 兜底：极端情况下 cos 仍可能 NaN（如 grid 跑出有效域 + ref_s 全 0）
+        score_map = torch.nan_to_num(score_map, nan=1.0, posinf=2.0, neginf=0.0)
         m2d = mask.squeeze()
         vc = m2d.sum().item()
         if vc < 10:
             return 1.0, 0.0
         dissim = (score_map * m2d).sum().item() / (vc + 1e-8)
         overlap = vc / (H_feat * W_feat)
-        return dissim, overlap
+        return float(dissim), float(overlap)
 
     depths_a, Ks_a, confs_a = [], [], []
     for i in range(N):
@@ -685,10 +872,14 @@ def _compute_feature_sim_from_npz(
                 grid, mask = _warp_grid(depths_a[i], Ks_a[i], c2w_all[i], Ks_a[j], c2w_all[j], confs_a[i])
                 d, o = _pair_score(features[i:i+1], features[j:j+1], grid, mask)
                 row_d.append(d); row_o.append(o)
-            dissim_scores.append(float(np.mean(row_d)) if row_d else 1.0)
-            overlap_ratios.append(float(np.mean(row_o)) if row_o else 0.0)
+            # 用 nanmean：单个 NaN 不污染整行
+            dissim_scores.append(float(np.nanmean(row_d)) if row_d else 1.0)
+            overlap_ratios.append(float(np.nanmean(row_o)) if row_o else 0.0)
 
     mean_dissim = float(np.nanmean(dissim_scores)) if dissim_scores else 1.0
+    # mean_dissim 仍为 NaN（极少数情况：所有 pair 都 NaN）→ reward 兜底为 0
+    if not np.isfinite(mean_dissim):
+        mean_dissim = 1.0
     reward = max(0.0, 1.0 - mean_dissim)
     details = {
         "compare_mode": compare_mode,

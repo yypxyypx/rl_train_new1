@@ -6,6 +6,18 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Env bootstrap：reward 子进程的统一入口
+#   - RL_MODEL_ROOT     : reward 模型的根目录（VideoAlign / DA3 / SAM3 / DINOv2 / FeatUp / Qwen2-VL / ...）
+#   - 所有模型都已平铺为本地路径，加载时不查 HF cache、不下载
+#     → 不需要 HF_HOME / TORCH_HOME，不需要代理
+#   - rich 是 trl 的 lazy import 依赖；容器 overlay 重启会丢，幂等补回
+# ─────────────────────────────────────────────────────────────────────────────
+export RL_MODEL_ROOT="${RL_MODEL_ROOT:-${REPO_ROOT}/model}"
+
+~/miniconda3/envs/Videoalign/bin/python -c "import rich" 2>/dev/null || \
+    ~/miniconda3/envs/Videoalign/bin/pip install -q rich 2>&1 | tail -1 || true
+
 CONFIG_FILE="${REPO_ROOT}/config/reward.sh"
 if [[ -f "$CONFIG_FILE" ]]; then
     source "$CONFIG_FILE"
@@ -61,9 +73,9 @@ fi
 CONDA_ENV="rl_da3"
 PYTHON_BIN=""
 for candidate in \
-    "/opt/conda/envs/${CONDA_ENV}/bin/python" \
     "${HOME}/miniconda3/envs/${CONDA_ENV}/bin/python" \
-    "${HOME}/anaconda3/envs/${CONDA_ENV}/bin/python"; do
+    "${HOME}/anaconda3/envs/${CONDA_ENV}/bin/python" \
+    "/opt/conda/envs/${CONDA_ENV}/bin/python"; do
     if [[ -f "$candidate" ]]; then
         PYTHON_BIN="$candidate"
         break

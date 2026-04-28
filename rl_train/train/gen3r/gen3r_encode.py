@@ -227,31 +227,61 @@ def transformer_forward(
     cfg_scale: float,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Gen3R Transformer 单步前向，支持 CFG。
+    """Gen3R Transformer 单步前向，支持 CFG 与批量推理（ng > 1）。
 
-    Transformer 接口：(x, context, t, seq_len, y, y_camera, clip_fea)
+    Transformer 接口：
+      x        : List[Tensor[C, F, H, W]]         — 每样本一个无 batch 维的 tensor
+      context  : List[Tensor[L, C]]                — 每样本一个文本 embedding
+      y        : Tensor[B, 20, f, h, w*2]          — control latents，有 batch 维
+      y_camera : Tensor[B, 24, f, h, w*2]          — plucker，有 batch 维
+      clip_fea : Tensor[B, 257, 1280]              — CLIP，有 batch 维
+
+    当 z.shape[0] = ng > 1 时自动构造 ng 份 context list。
     """
+    ng = z.shape[0]
+
+    # 条件张量如果是 [1,...] 而 z 是 [ng,...]，需要 expand
+    if ng > 1 and control_latents.shape[0] == 1:
+        control_latents = control_latents.expand(ng, *control_latents.shape[1:])
+    if ng > 1 and plucker_embeds.shape[0] == 1:
+        plucker_embeds = plucker_embeds.expand(ng, *plucker_embeds.shape[1:])
+    if ng > 1 and clip_context.shape[0] == 1:
+        clip_context = clip_context.expand(ng, *clip_context.shape[1:])
+
+    # context 是 list[Tensor[L, C]]，每个元素对应一个样本（无 batch 维）
+    # prompt_embeds/neg_embeds 里的每个 tensor 可能是 [L, C] 或 [1, L, C]
+    def _to_list(emb_list: list, n: int) -> list:
+        """把 [tensor([L,C])] 展开为 n 个 [L,C] 的 list。"""
+        e = emb_list[0]
+        if e.dim() == 3:
+            e = e.squeeze(0)   # [1,L,C] → [L,C]
+        return [e] * n
+
     if cfg_scale > 1.0:
-        z_in = torch.cat([z, z], dim=0)
+        # CFG：batch 为 [ng(uncond) + ng(cond)]，共 2*ng
+        z_in = torch.cat([z, z], dim=0)              # [2*ng, C, F, H, W*2]
         t_in = torch.cat([timesteps, timesteps], dim=0)
-        ctx_in = neg_embeds + prompt_embeds  # list concat（CFG: uncond first）
-        ctrl_in = torch.cat([control_latents, control_latents], dim=0)
-        plk_in = torch.cat([plucker_embeds, plucker_embeds], dim=0)
-        clip_in = torch.cat([clip_context, clip_context], dim=0)
+        ctx_in = _to_list(neg_embeds, ng) + _to_list(prompt_embeds, ng)  # 2*ng 个 [L,C]
+        ctrl_in = torch.cat([control_latents, control_latents], dim=0)   # [2*ng, 20, f, h, w*2]
+        plk_in  = torch.cat([plucker_embeds, plucker_embeds], dim=0)     # [2*ng, 24, f, h, w*2]
+        clip_in = torch.cat([clip_context, clip_context], dim=0)         # [2*ng, 257, 1280]
 
         with torch.autocast("cuda", dtype):
             pred = transformer(
                 x=z_in, context=ctx_in, t=t_in, seq_len=seq_len,
                 y=ctrl_in, y_camera=plk_in, clip_fea=clip_in,
             )
-        pred_uncond, pred_cond = pred.chunk(2)
+        # pred shape: [2*ng, C, F, H, W*2]
+        pred_uncond = pred[:ng]
+        pred_cond   = pred[ng:]
         pred = pred_uncond.to(torch.float32) + cfg_scale * (
             pred_cond.to(torch.float32) - pred_uncond.to(torch.float32)
         )
     else:
+        ctx_in = _to_list(prompt_embeds, ng)  # ng 个 [L,C]
         with torch.autocast("cuda", dtype):
             pred = transformer(
-                x=z, context=prompt_embeds, t=timesteps, seq_len=seq_len,
+                x=z, context=ctx_in, t=timesteps, seq_len=seq_len,
                 y=control_latents, y_camera=plucker_embeds, clip_fea=clip_context,
             )
         pred = pred.to(torch.float32)
@@ -290,14 +320,57 @@ def decode_rgb_video(
             video = wan_vae.decode(wan_latent).sample  # [1, 3, F, H, W], [-1, 1]
 
     video_01 = (video / 2 + 0.5).clamp(0, 1)
-    frames_np = (
-        video_01[0].permute(1, 2, 3, 0).float().cpu().numpy() * 255
-    ).astype(np.uint8)  # [F, H, W, 3]
-    frames = list(frames_np)
+    # export_to_video 期望输入为 float32 [0,1]（内部自行 *255 转 uint8）
+    # 直接传 uint8 会导致二次 *255 失真
+    frames_f32 = video_01[0].permute(1, 2, 3, 0).float().cpu().numpy()  # [F, H, W, 3] float32 [0,1]
+    frames = list(frames_f32)
 
     os.makedirs(os.path.dirname(os.path.abspath(video_path)), exist_ok=True)
     export_to_video(frames, video_path, fps=fps)
     return video_path
+
+
+def decode_rgb_videos_batch(
+    final_latents: torch.Tensor,
+    wan_vae,
+    video_paths: list,
+    fps: int = 16,
+    micro_batch: int = 4,
+) -> list:
+    """批量解码并保存 N 条 rollout 的视频。
+
+    将 [N, 16, f, h, w*2] 切片成 wan_latent [N, 16, f, h, w]，按 micro_batch 分块
+    一次性 decode（一次 VAE 调用替代 N 次），结果一一写盘。
+
+    显存：单条 latent ~16MB（bf16），输出 video [N,3,F,H,W] fp32 ~1.5GB at N=8/F=49/560²。
+    若担心 OOM，调小 micro_batch（默认 4，安全）。
+    """
+    assert final_latents.dim() == 5, f"expect [N,C,F,H,W*2], got {final_latents.shape}"
+    N = final_latents.shape[0]
+    assert len(video_paths) == N, f"got {N} latents but {len(video_paths)} paths"
+
+    latent_w = final_latents.shape[-1] // 2
+    wan_latents = final_latents[..., :latent_w]  # [N, 16, f, h, w]
+
+    if hasattr(wan_vae, "enable_tiling"):
+        wan_vae.enable_tiling()
+
+    out_paths = []
+    for s in range(0, N, micro_batch):
+        e = min(s + micro_batch, N)
+        with torch.inference_mode():
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                video = wan_vae.decode(wan_latents[s:e]).sample  # [b, 3, F, H, W]
+        video_01 = (video / 2 + 0.5).clamp(0, 1)
+        for j in range(video_01.shape[0]):
+            frames_f32 = video_01[j].permute(1, 2, 3, 0).float().cpu().numpy()
+            frames = list(frames_f32)
+            vp = video_paths[s + j]
+            os.makedirs(os.path.dirname(os.path.abspath(vp)), exist_ok=True)
+            export_to_video(frames, vp, fps=fps)
+            out_paths.append(vp)
+        del video, video_01
+    return out_paths
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -346,7 +419,6 @@ def save_gt_video(
     fps: int = 16,
 ) -> None:
     """将 [F, C, H, W] float32 [0,1] 的 GT 帧序列保存为 MP4。"""
-    frames = pixel_values.float().cpu().permute(0, 2, 3, 1).numpy()
-    frames = (frames * 255).clip(0, 255).astype(np.uint8)
+    frames = pixel_values.float().cpu().permute(0, 2, 3, 1).numpy()  # [F, H, W, 3] float32 [0,1]
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     export_to_video(list(frames), out_path, fps=fps)

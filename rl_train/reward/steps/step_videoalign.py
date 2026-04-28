@@ -26,7 +26,7 @@ _THIRD_PARTY_DIR = _RL_CODE_DIR / "third_party"
 
 VIDEOALIGN_ROOT = str(_THIRD_PARTY_DIR / "repos" / "VideoAlign" / "VideoAlign")
 CHECKPOINT_PATH = str(
-    Path(os.environ.get("RL_MODEL_ROOT", str(_RL_CODE_DIR.parent / "RL" / "model")))
+    Path(os.environ.get("RL_MODEL_ROOT", str(_RL_CODE_DIR / "model")))
     / "Videoalign" / "VideoReward"
 )
 

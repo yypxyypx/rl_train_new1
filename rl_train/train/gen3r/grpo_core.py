@@ -101,37 +101,44 @@ def run_sample_step(
     clip_context: torch.Tensor,
     transformer_forward_fn,
 ):
-    """完整去噪轨迹（Rollout），支持 hybrid SDE/ODE 模式。
+    """完整去噪轨迹（Rollout），支持批量并行推理与 hybrid SDE/ODE 模式。
+
+    支持 batch_size > 1：z 的第 0 维为 ng（rollout 数），所有 rollout 共享
+    同一组条件编码（control_latents, plucker_embeds, clip_context），在同一次
+    transformer forward 中并行去噪，充分利用 GPU 算力。
 
     当 args.train_timestep_strategy == "front" 时：
         前 sde_steps 步使用 SDE（eta>0），记录 latent + log_prob 用于训练；
         后续步骤切换为 ODE（eta=0），只为生成最终视频，不记录。
-    当 args.train_timestep_strategy == "random" 时（默认）：
-        所有步骤使用 SDE，和原始 DanceGRPO 一致。
 
     Args:
-        z               : 初始噪声 [1, 16, f, h, w*2]
+        z               : 初始噪声 [ng, 16, f, h, w*2]（ng 可以 > 1）
         sigma_schedule  : [T+1]
         transformer_forward_fn : gen3r_encode.transformer_forward 的函数引用
 
     Returns:
-        final_z        : 去噪后的 z_T
-        pred_x0        : 最后一步预测的 x0（用于解码）
-        all_latents    : [1, K+1, 16, f, h, w*2]  (K = sde_steps or T)
-        all_log_probs  : [1, K]
+        final_z        : [ng, 16, f, h, w*2]  全部 T 步去噪完的 latent
+        pred_x0        : [ng, 16, f, h, w*2]  最后一步预测的 x0
+        all_latents    : [ng, K+1, 16, f, h, w*2]  (K = sde_steps or T)
+        all_log_probs  : [ng, K]
     """
     T = args.sampling_steps
     strategy = getattr(args, "train_timestep_strategy", "random")
     sde_fraction = getattr(args, "sde_fraction", 1.0)
     sde_steps = max(1, int(T * sde_fraction)) if strategy == "front" else T
 
+    ng = z.shape[0]  # batch size = num_generations
+    # control_latents/plucker_embeds/clip_context 的 expand 由 transformer_forward 内部处理
+    # 这里只需把 timesteps 扩展到 [ng]（由调用方保证或在 run_sample_step 内构造）
+
     all_latents = [z]
     all_log_probs = []
+    pred_original = z  # fallback
 
     for i in tqdm(range(T), desc="Sampling", leave=False):
         sigma = sigma_schedule[i]
         timestep_val = int(sigma * 1000)
-        timesteps = torch.full([1], timestep_val, device=z.device, dtype=torch.long)
+        timesteps = torch.full([ng], timestep_val, device=z.device, dtype=torch.long)
 
         transformer.eval()
         with torch.no_grad():
@@ -160,8 +167,8 @@ def run_sample_step(
             z = z.to(torch.bfloat16)
 
     pred_x0 = pred_original
-    all_latents = torch.stack(all_latents, dim=1)      # [1, K+1, ...]
-    all_log_probs = torch.stack(all_log_probs, dim=1)  # [1, K]
+    all_latents = torch.stack(all_latents, dim=1)      # [ng, K+1, ...]
+    all_log_probs = torch.stack(all_log_probs, dim=1)  # [ng, K]
     return z, pred_x0, all_latents, all_log_probs
 
 

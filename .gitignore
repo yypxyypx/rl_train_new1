@@ -86,9 +86,24 @@ rl_train/train/gen3r/t5_cache/
 wild_test/wild_test_data/
 wild_test/results/
 
-# Gen3R: nested upstream clone + large weights — clone/maintain separately or use submodule
-eval/infer/gen3r/Gen3R/
-rl_train/train/gen3r/Gen3R/
+# Gen3R / VideoX-Fun：与主仓库一并版本化（代码树；checkpoint 等大文件仍由上面对 *.safetensors 等规则排除）
+
+# HuggingFace / 本地 RL 数据集与 manifest（体积大，仅保留脚本与说明即可）
+hf_datasets/
+
+# 整棵 model/ 权重目录（约百 GB 级；*.safetensors 等已在上方全局忽略，此处防止非常规后缀或误 add 整目录）
+model/
+
+# Wan2.2 训练/推理输出与 T5 缓存（路径与脚本默认一致时可再加）
+rl_train/train/wan2_2/infer_outputs/
+rl_train/train/wan2_2/outputs/
+data/t5_cache_wan22/
+
+# Secrets & 本地覆盖
+credentials.json
+**/secrets/
+.cursor/
+.dmypy.json
 
 # OS / editor
 .DS_Store

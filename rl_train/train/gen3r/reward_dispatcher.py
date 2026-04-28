@@ -149,9 +149,14 @@ def _run_step_subprocess(
 
 
 def _wait_for_markers(markers: list[Path], timeout: float = 3600.0, poll: float = 5.0) -> bool:
-    """等待所有标记文件出现，返回 True 表示全部 OK，False 表示超时或有失败。"""
+    """等待所有标记文件出现，返回 True 表示全部 OK，False 表示有失败或超时。
+
+    修复：即使某个 step 失败，也继续等待其余 step 完成，避免提前返回导致
+    compute_all_rewards 在 DA3/DINOv2 npz 文件未写完前就被调用（FUSE 竞态）。
+    """
     start = time.time()
     pending = set(str(m) for m in markers)
+    failed = set()
     while pending and (time.time() - start) < timeout:
         to_remove = set()
         for mp in list(pending):
@@ -160,13 +165,15 @@ def _wait_for_markers(markers: list[Path], timeout: float = 3600.0, poll: float 
                 content = p.read_text().strip()
                 if content.startswith("FAILED"):
                     print(f"[Dispatcher] Marker FAILED: {mp}  content={content}")
-                    return False
-                to_remove.add(mp)
+                    failed.add(mp)
+                to_remove.add(mp)  # 无论成功失败都移出 pending，继续等其他
         pending -= to_remove
         if pending:
             time.sleep(poll)
     if pending:
         print(f"[Dispatcher] Timeout waiting for: {pending}")
+        return False
+    if failed:
         return False
     return True
 
@@ -357,8 +364,9 @@ class RewardDispatcher:
 
         # ── 等待所有组完成 ────────────────────────────────────────────────────
         ok = _wait_for_markers(markers, timeout=timeout)
+        # join timeout 对齐 _wait_for_markers timeout，避免 DA3 未写完就聚合
         for t in threads:
-            t.join(timeout=30)
+            t.join(timeout=timeout)
 
         if not ok:
             print(f"[Dispatcher] WARNING: some steps failed/timed out for {video_path}")

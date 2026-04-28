@@ -424,6 +424,12 @@ def _compute_summary(records: list) -> dict:
         ("depth_reprojection", "global", "reward"),
         ("videoalign", "Overall"),
         ("feature_sim", "reward_feature_sim"),
+        ("global_point_cloud", "chamfer_distance"),
+        ("global_point_cloud", "fscore"),
+        ("global_point_cloud", "accuracy"),
+        ("global_point_cloud", "completeness"),
+        ("global_point_cloud", "precision"),
+        ("global_point_cloud", "recall"),
     ]
     for keys in fields:
         vals = _collect(records, *keys)

@@ -1,86 +1,64 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════════
 # 推理配置 — 对应 eval/infer/infer.sh
+#
 # 修改此文件后，直接运行：
 #   bash eval/infer/infer.sh
 # 命令行参数可覆盖此处的值，例如：
 #   bash eval/infer/infer.sh --num_gpus 4 --output /other/path
 #
-# 注：${REPO_ROOT} 由 infer.sh 在 source 本文件前自动设置，
-#     代表 RL_code/ 项目根目录，可直接在此处引用。
+# 注：${REPO_ROOT} 由 infer.sh 在 source 本文件前自动设置。
 # ═══════════════════════════════════════════════════════════════════
 
-# ── 模型 ──────────────────────────────────────────────────────────
-
-# 模型名，对应 eval/infer/ 下的子文件夹（如 gen3r）
+# ── 模型名（对应 eval/infer/ 下的子文件夹）────────────────────────
+# 可选：gen3r | wan2.2
 MODEL="gen3r"
 
 # ── [必填] Checkpoint 路径 ────────────────────────────────────────
 
-# 使用仓库内自带的 Gen3R checkpoint（相对于项目根目录）
+# Gen3R 基础模型 checkpoint
 CHECKPOINT="${REPO_ROOT}/eval/infer/gen3r/Gen3R/checkpoints"
 
-# 若使用 RL 训练后的 checkpoint，改为类似：
-# CHECKPOINT="${REPO_ROOT}/rl_train/grpo_outputs/checkpoint-200"
+# Wan2.2 基础模型 checkpoint（切换模型时取消注释）
+# CHECKPOINT="${REPO_ROOT}/model/Wan2.2-Fun-5B-Control-Camera"
 
-# ── 输入数据（三选一） ────────────────────────────────────────────
+# ── Checkpoint 标识（用作输出目录中间层）─────────────────────────
+# 默认等于 ${MODEL}，可以设置为 checkpoint 步数等，方便多次对比：
+# CKPT_TAG="gen3r_baseline"
+# CKPT_TAG="gen3r_step200"
+CKPT_TAG=""   # 留空 = 用 ${MODEL} 值
 
-# 方式1：处理后的数据根目录（脚本自动 build_manifest）
-DATA="/path/to/processed"
+# ── 输入数据（三选一）────────────────────────────────────────────
 
-# 配合 DATA 使用，指定数据集（逗号分隔）
-DATASETS="re10k,dl3dv"
+# 方式1：数据根目录（自动 build_manifest）
+DATA="/mnt/afs/visitor16/rl_train_new/hf_datasets/rl_data/gen3r"
+DATASETS="dl3dv,scannet++"
 
-# 方式2：预构建的 manifest.jsonl（与 DATA 二选一，留空则用 DATA）
+# 方式2：预构建 manifest.jsonl（与 DATA 二选一，留空则用 DATA）
 MANIFEST=""
 
-# 方式3：单个样本目录（调试用，留空则用 DATA / MANIFEST）
+# 方式3：单个样本目录（调试用）
 SAMPLE_DIR=""
 
-# ── [必填] 输出目录 ───────────────────────────────────────────────
-
-OUTPUT="/path/to/output"
+# ── [必填] 输出根目录 ─────────────────────────────────────────────
+# 实际写入：${OUTPUT}/${CKPT_TAG}/<dataset>/<sample_id>/
+OUTPUT="/path/to/eval_output"
 
 # ── GPU & 并行 ────────────────────────────────────────────────────
-
-# GPU 数量（>1 时自动用 torchrun）
 NUM_GPUS=1
-
-# torchrun 的 master port（多卡时使用）
 MASTER_PORT=29500
 
-# ── 生成参数 ──────────────────────────────────────────────────────
+# ── 每数据集最多取多少条（0=全部）───────────────────────────────
+MAX_PER_DATASET=0
 
-# 每个样本生成多少条 rollout 视频
-NUM_ROLLOUTS=8
-
-# 生成帧数
-NUM_FRAMES=49
-
-# 输出分辨率
-TARGET_SIZE=560
-
-# SDE 噪声强度（η）
-ETA=0.3
-
-# 去噪步数
-STEPS=50
-
-# CFG scale
-GUIDANCE=5.0
-
-# sigma schedule shift
-SHIFT=2.0
-
-# 随机种子基值
+# ── 随机种子 ──────────────────────────────────────────────────────
 SEED=42
 
-# ── 标志位（留空=关闭，填写对应 flag 字符串=开启）─────────────────
-
+# ── 标志位 ────────────────────────────────────────────────────────
 # 跳过已完成样本：留空 或 "--skip_done"
 SKIP_DONE="--skip_done"
 
-# 设备模式：server（全量 GPU）| local（CPU offload）
+# 设备模式（gen3r 用）：server（全量 GPU）| local（CPU offload）
 DEVICE_MODE="server"
 
 # 只处理含 gt.mp4 的样本：留空 或 "--require_gt_video"

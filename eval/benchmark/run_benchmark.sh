@@ -112,7 +112,8 @@ echo "  n_fps:        $N_FPS"
 echo "  conf_thresh:  $CONF_THRESH"
 echo "════════════════════════════════════════════════"
 
-CMD="python -u ${SCRIPT_DIR}/run_benchmark.py \
+BENCH_PYTHON="${BENCH_PYTHON:-/root/miniconda3/envs/rl_da3/bin/python}"
+CMD="${BENCH_PYTHON} -u ${SCRIPT_DIR}/run_benchmark.py \
     --output_root ${OUTPUT_ROOT} \
     --metrics ${METRICS} \
     --gpu ${GPU} \

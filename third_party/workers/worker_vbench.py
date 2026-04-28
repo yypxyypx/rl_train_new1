@@ -43,11 +43,11 @@ if str(_VBENCH_DIR) not in sys.path:
     sys.path.insert(0, str(_VBENCH_DIR))
 
 # 自动探测 vbench_cache（支持 RL_MODEL_ROOT 环境变量）
-_WORKSPACE = _THIRD_PARTY_DIR.parent.parent
-_ENV_MODEL = Path(os.environ.get("RL_MODEL_ROOT", str(_WORKSPACE / "RL" / "model")))
+_RL_CODE_DIR = _THIRD_PARTY_DIR.parent
+_ENV_MODEL = Path(os.environ.get("RL_MODEL_ROOT", str(_RL_CODE_DIR / "model")))
 _VBENCH_CANDIDATES = [
     _ENV_MODEL / "vbench_cache",
-    _WORKSPACE / "RL" / "model" / "vbench_cache",
+    _RL_CODE_DIR / "model" / "vbench_cache",
     Path.home() / "WAN_TEST" / "model" / "vbench_cache",
 ]
 _VBENCH_CACHE_DEFAULT = str(next(

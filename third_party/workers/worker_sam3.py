@@ -49,8 +49,8 @@ for _p in [str(_SAM3_SRC), str(_SAM3_PKG)]:
         sys.path.insert(0, _p)
 
 # ── 默认模型路径 ──────────────────────────────────────────────────────────────
-_WORKSPACE = _THIRD_PARTY_DIR.parent.parent
-_MODEL_DIR  = Path(os.environ.get("RL_MODEL_ROOT", str(_WORKSPACE / "RL" / "model")))
+_RL_CODE_DIR = _THIRD_PARTY_DIR.parent
+_MODEL_DIR  = Path(os.environ.get("RL_MODEL_ROOT", str(_RL_CODE_DIR / "model")))
 QWEN_MODEL  = str(_MODEL_DIR / "Qwen3-VL-8B-Instruct")
 SAM3_CKPT   = str(_MODEL_DIR / "SAM3" / "sam3.pt")
 SAM3_BPE    = str(_SAM3_PKG / "sam3" / "sam3" / "assets" / "bpe_simple_vocab_16e6.txt.gz")

@@ -20,11 +20,11 @@ from pathlib import Path
 import torch
 
 _THIRD_PARTY_DIR = Path(__file__).resolve().parent.parent
-_WORKSPACE = _THIRD_PARTY_DIR.parent.parent  # /home/users/.../
+_RL_CODE_DIR = _THIRD_PARTY_DIR.parent
 
 VIDEOALIGN_ROOT = str(_THIRD_PARTY_DIR / "repos" / "VideoAlign" / "VideoAlign")
 CHECKPOINT_PATH = str(
-    Path(os.environ.get("RL_MODEL_ROOT", str(_WORKSPACE / "RL" / "model")))
+    Path(os.environ.get("RL_MODEL_ROOT", str(_RL_CODE_DIR / "model")))
     / "Videoalign" / "VideoReward"
 )
 

@@ -47,11 +47,11 @@ class IntermediateManager:
 
     @staticmethod
     def _find_vbench_cache() -> str:
-        _workspace = _THIRD_PARTY_DIR.parent.parent
-        model_root = Path(os.environ.get("RL_MODEL_ROOT", str(_workspace / "RL" / "model")))
+        _rl_code_dir = _THIRD_PARTY_DIR.parent
+        model_root = Path(os.environ.get("RL_MODEL_ROOT", str(_rl_code_dir / "model")))
         candidates = [
             model_root / "vbench_cache",
-            _workspace / "RL" / "model" / "vbench_cache",
+            _rl_code_dir / "model" / "vbench_cache",
             Path.home() / "WAN_TEST" / "model" / "vbench_cache",
         ]
         return str(next(
@@ -84,7 +84,8 @@ class IntermediateManager:
 
     def _run_da3(self, entries: list, tmp_dir: Path):
         step_da3 = str(_REWARD_CODE / "step_da3.py")
-        py = sys.executable
+        # DA3 依赖 moviepy/omegaconf 等，使用专用 rl_da3 环境
+        py = env_python("rl_da3")
 
         for entry in entries:
             sample_id = entry["sample_id"]

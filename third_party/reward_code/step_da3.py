@@ -20,11 +20,11 @@ import torch
 from PIL import Image
 
 _THIRD_PARTY_DIR = Path(__file__).resolve().parent.parent
-_WORKSPACE = _THIRD_PARTY_DIR.parent.parent  # /home/users/.../
+_RL_CODE_DIR = _THIRD_PARTY_DIR.parent
 
 DA3_SRC = str(_THIRD_PARTY_DIR / "repos" / "DA3" / "Depth-Anything-3" / "src")
 DA3_WEIGHTS = str(
-    Path(os.environ.get("RL_MODEL_ROOT", str(_WORKSPACE / "RL" / "model")))
+    Path(os.environ.get("RL_MODEL_ROOT", str(_RL_CODE_DIR / "model")))
     / "DA3NESTED-GIANT-LARGE-1.1"
 )
 

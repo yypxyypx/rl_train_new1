@@ -241,6 +241,7 @@ class RLDataset(Dataset):
         resolution: int = 560,
         frame_mode: str = "video",
         dataset_weights: Optional[List[float]] = None,
+        train_manifest: Optional[str] = None,
     ):
         super().__init__()
         self.num_frames = num_frames
@@ -255,38 +256,95 @@ class RLDataset(Dataset):
         self.dataset_names: List[str] = []
         per_dataset: Dict[str, List[Dict]] = {}
 
-        for ds_name in datasets:
-            ds_dir = Path(data_root) / ds_name
-            if not ds_dir.exists():
-                print(f"[RLDataset] WARNING: {ds_dir} not found, skipping")
-                continue
-            ds_samples = []
-            for sample_dir in sorted(ds_dir.iterdir()):
-                if not sample_dir.is_dir():
-                    continue
-                cam_txt = sample_dir / "camera.txt"
-                meta_json = sample_dir / "metadata.json"
-                if not cam_txt.exists() or not meta_json.exists():
-                    continue
-                if frame_mode == "video":
-                    media = sample_dir / "gt.mp4"
-                else:
-                    media = sample_dir / "frames"
-                if not media.exists():
-                    continue
-                ds_samples.append({
-                    "sample_id": sample_dir.name,
-                    "dataset_name": ds_name,
-                    "camera_txt": str(cam_txt),
-                    "metadata_json": str(meta_json),
-                    "media": str(media),
-                })
-            per_dataset[ds_name] = ds_samples
-            self.dataset_names.append(ds_name)
-            print(f"[RLDataset] {ds_name}: {len(ds_samples)} samples")
+        # ── 模式 A：manifest 驱动（推荐，与 t5 预计算/数据归档保持一致）───────
+        if train_manifest:
+            manifest_path = Path(train_manifest)
+            if not manifest_path.is_file():
+                raise FileNotFoundError(f"train_manifest not found: {manifest_path}")
+            allow = set(datasets) if datasets else None
+            print(f"[RLDataset] loading manifest: {manifest_path}"
+                  f"  (filter datasets={sorted(allow) if allow else 'ALL'})")
+            with open(manifest_path, "r") as f:
+                for line_idx, line in enumerate(f):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError as e:
+                        print(f"[RLDataset] skip malformed line {line_idx}: {e}")
+                        continue
+                    ds_name = rec.get("dataset")
+                    sample_dir = rec.get("sample_dir")
+                    if not ds_name or not sample_dir:
+                        continue
+                    if allow is not None and ds_name not in allow:
+                        continue
+                    sd = Path(sample_dir)
+                    cam_txt = sd / "camera.txt"
+                    meta_json = Path(rec.get("metadata_json") or (sd / "metadata.json"))
+                    if not cam_txt.exists() or not meta_json.exists():
+                        continue
+                    if frame_mode == "video":
+                        media = sd / "gt.mp4"
+                    else:
+                        media = sd / "frames"
+                    if not media.exists():
+                        continue
+                    per_dataset.setdefault(ds_name, []).append({
+                        "sample_id": rec.get("sample_id", sd.name),
+                        "dataset_name": ds_name,
+                        "sample_dir": str(sd),
+                        "camera_txt": str(cam_txt),
+                        "metadata_json": str(meta_json),
+                        "media": str(media),
+                    })
+            for ds_name, ds_samples in per_dataset.items():
+                self.dataset_names.append(ds_name)
+                print(f"[RLDataset] {ds_name}: {len(ds_samples)} samples (manifest)")
+            # 保持 datasets 入参的顺序（影响采样权重映射）
+            if datasets:
+                self.dataset_names = [d for d in datasets if d in per_dataset]
 
-        if not per_dataset:
-            raise ValueError(f"No valid samples found in {data_root} for datasets {datasets}")
+        # ── 模式 B：目录扫描（旧逻辑，递归到 train/ 子目录下找 metadata.json）─
+        else:
+            for ds_name in datasets:
+                ds_dir = Path(data_root) / ds_name
+                if not ds_dir.exists():
+                    print(f"[RLDataset] WARNING: {ds_dir} not found, skipping")
+                    continue
+                # 递归找 metadata.json，匹配 unified_data_process 输出的多层目录
+                ds_samples = []
+                for meta_json in sorted(ds_dir.rglob("metadata.json")):
+                    sample_dir = meta_json.parent
+                    cam_txt = sample_dir / "camera.txt"
+                    if not cam_txt.exists():
+                        continue
+                    if frame_mode == "video":
+                        media = sample_dir / "gt.mp4"
+                    else:
+                        media = sample_dir / "frames"
+                    if not media.exists():
+                        continue
+                    ds_samples.append({
+                        "sample_id": sample_dir.name,
+                        "dataset_name": ds_name,
+                        "sample_dir": str(sample_dir),
+                        "camera_txt": str(cam_txt),
+                        "metadata_json": str(meta_json),
+                        "media": str(media),
+                    })
+                per_dataset[ds_name] = ds_samples
+                self.dataset_names.append(ds_name)
+                print(f"[RLDataset] {ds_name}: {len(ds_samples)} samples (rglob)")
+
+        if not per_dataset or not any(per_dataset.values()):
+            src = f"manifest={train_manifest}" if train_manifest else f"data_root={data_root}"
+            raise ValueError(
+                f"No valid samples found ({src}, datasets={datasets}). "
+                f"Each sample dir must contain camera.txt + metadata.json + "
+                f"({'gt.mp4' if frame_mode == 'video' else 'frames/'})."
+            )
 
         # 计算采样权重
         if dataset_weights is None:
@@ -306,10 +364,12 @@ class RLDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
-        # 按权重随机选择数据集，再随机选样本（balanced sampling）
-        ds_name = np.random.choice(self.dataset_names, p=self.dataset_probs)
-        ds_samples = self.per_dataset[ds_name]
-        info = ds_samples[np.random.randint(0, len(ds_samples))]
+        # 确定性 index 查表：DistributedSampler 给出的 index 必须真实生效，
+        # 否则 (1) 同 sub-group 的两张卡拿到的不是同一条 prompt
+        #      (2) 中断后无法靠 step 计数器复现样本顺序做 resume
+        # 跨 dataset 的均衡由 DistributedSampler 的 shuffle 在全集 3200 条上保证
+        # （dl3dv 1600 + scannet++ 1600，本身就是 50/50 平衡）。
+        info = self.samples[index % len(self.samples)]
         return self._load_sample(info)
 
     def _load_sample(self, info: Dict) -> Dict[str, Any]:
@@ -356,6 +416,7 @@ class RLDataset(Dataset):
             "Ks": Ks_sampled,                 # [F,3,3] 像素内参
             "sample_id": info["sample_id"],
             "dataset_name": info["dataset_name"],
+            "sample_dir": info.get("sample_dir", ""),  # 用于 in-place T5 embed 查找
             "camera_txt_path": camera_txt,    # 原始 camera.txt（reward 直接使用）
             "gt_video_path": media if self.frame_mode == "video" else str(Path(media).parent / "gt.mp4"),
         }
@@ -374,6 +435,7 @@ def collate_fn(batch: List[Dict]) -> Dict:
         "Ks":               [s["Ks"] for s in batch],
         "sample_id":        [s["sample_id"] for s in batch],
         "dataset_name":     [s["dataset_name"] for s in batch],
+        "sample_dir":       [s.get("sample_dir", "") for s in batch],
         "camera_txt_path":  [s["camera_txt_path"] for s in batch],
         "gt_video_path":    [s["gt_video_path"] for s in batch],
     }
@@ -389,6 +451,7 @@ def build_rl_dataset(args) -> RLDataset:
     期望 args 字段：
         data_root, datasets (逗号分隔字符串),
         num_frames, frame_stride, resolution, frame_mode
+        train_manifest (可选；为空则走目录扫描)
     """
     dataset_list = [d.strip() for d in args.datasets.split(",") if d.strip()]
     return RLDataset(
@@ -398,4 +461,5 @@ def build_rl_dataset(args) -> RLDataset:
         stride=args.frame_stride,
         resolution=args.resolution,
         frame_mode=args.frame_mode,
+        train_manifest=getattr(args, "train_manifest", None) or None,
     )

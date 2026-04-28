@@ -28,7 +28,7 @@ _THIRD_PARTY_DIR = _RL_CODE_DIR / "third_party"
 
 DA3_SRC = str(_THIRD_PARTY_DIR / "repos" / "DA3" / "Depth-Anything-3" / "src")
 DA3_WEIGHTS = str(
-    Path(os.environ.get("RL_MODEL_ROOT", str(_RL_CODE_DIR.parent / "RL" / "model")))
+    Path(os.environ.get("RL_MODEL_ROOT", str(_RL_CODE_DIR / "model")))
     / "DA3NESTED-GIANT-LARGE-1.1"
 )
 

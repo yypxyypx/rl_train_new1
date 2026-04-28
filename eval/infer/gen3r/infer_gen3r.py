@@ -1,39 +1,40 @@
 #!/usr/bin/env python3
-"""Gen3R official pipeline inference for evaluation.
+"""Gen3R 官方 pipeline 推理（ODE）。
 
-Reads processed data (start.png, camera.txt, metadata.json) produced by
-data/unified_data_process.py, runs Gen3R SDE inference with a given
-checkpoint, and outputs gen_0.mp4 ~ gen_{N-1}.mp4 in a format aligned
-with the eval/reward pipeline.
+使用 Gen3RPipeline.__call__ 的官方 ODE 推理路径，不依赖任何 GRPO 训练代码。
+每条样本产出一个 gen_0.mp4，跳过 T5 文本编码器（从样本目录读取预编码的
+prompt_embed.pt / neg_embed.pt）。
 
-Supports:
-  - manifest.jsonl input (batch mode) or single sample directory
-  - Multi-GPU via torchrun (rollouts distributed round-robin across GPUs)
-  - Resumable via --skip_done
-  - Custom checkpoint path (for evaluating RL-trained checkpoints)
+多卡支持：按样本分片，torchrun --nproc_per_node=N 启动。
 
-Output per sample: <output_root>/<dataset>/<sample_id>/
-  gen_0.mp4 ~ gen_{N-1}.mp4   generated rollouts
-  start.png, gt.mp4, camera.txt, gt_depth.npz   copied from input
-  infer_info.json              inference parameters
+输出目录结构：
+  <output_root>/<dataset>/<sample_id>/
+    gen_0.mp4
+    start.png, gt.mp4, camera.txt, metadata.json  (从输入目录复制)
+    infer_info.json
 
-Usage:
-    torchrun --nproc_per_node=4 infer_gen3r.py \\
-        --manifest /path/to/manifest.jsonl \\
-        --checkpoint /path/to/gen3r_checkpoints \\
-        --output_root /path/to/output \\
-        [--num_rollouts 8] [--eta 0.3] [--num_inference_steps 50]
+用法：
+  # 单卡
+  python infer_gen3r.py \\
+      --manifest /path/to/manifest.jsonl \\
+      --checkpoint /path/to/gen3r_checkpoints \\
+      --output_root /path/to/output
 
-    # Single sample:
-    python infer_gen3r.py \\
-        --sample_dir /path/to/processed/re10k/scene_001 \\
-        --checkpoint /path/to/gen3r_checkpoints \\
-        --output_root /path/to/output
+  # 多卡
+  torchrun --nproc_per_node=4 infer_gen3r.py \\
+      --manifest /path/to/manifest.jsonl \\
+      --checkpoint /path/to/gen3r_checkpoints \\
+      --output_root /path/to/output
+
+  # 单样本调试
+  python infer_gen3r.py \\
+      --sample_dir /path/to/sample \\
+      --checkpoint /path/to/gen3r_checkpoints \\
+      --output_root /tmp/debug
 """
 
 import argparse
 import json
-import math
 import os
 import shutil
 import sys
@@ -46,26 +47,20 @@ import torch.distributed as dist
 from einops import rearrange
 from torchvision.transforms.functional import resize
 
-# ─── Gen3R imports ────────────────────────────────────────────────────────────
-# Expects gen3r/Gen3R to be available. Set GEN3R_ROOT env var or place
-# this script so that the relative path works.
-
+# ── Gen3R 路径 ────────────────────────────────────────────────────────────────
 _HERE = Path(__file__).resolve().parent
-_GEN3R_ROOT = Path(os.environ.get(
-    "GEN3R_ROOT",
-    str(_HERE / "Gen3R"),
-))
+_GEN3R_ROOT = Path(os.environ.get("GEN3R_ROOT", str(_HERE / "Gen3R")))
 if str(_GEN3R_ROOT) not in sys.path:
     sys.path.insert(0, str(_GEN3R_ROOT))
 
-from gen3r.pipeline import Gen3RPipeline  # noqa: E402
-from gen3r.utils.data_utils import (  # noqa: E402
+from gen3r.pipeline import Gen3RPipeline                    # noqa: E402
+from gen3r.utils.data_utils import (                        # noqa: E402
     center_crop, compute_rays, preprocess_poses, get_K,
 )
-from gen3r.utils.common_utils import save_videos_grid  # noqa: E402
+from gen3r.utils.common_utils import save_videos_grid       # noqa: E402
 
 
-# ─── decode_latents device-alignment patch ────────────────────────────────────
+# ── decode_latents 设备对齐补丁 ───────────────────────────────────────────────
 _orig_decode = Gen3RPipeline.decode_latents
 
 
@@ -80,36 +75,15 @@ def _decode_aligned(self, latents, min_max_depth_mask=False):
 Gen3RPipeline.decode_latents = _decode_aligned
 
 
-# ═══════════════════════ SDE Sampler ═══════════════════════
-
-
-def sd3_time_shift(shift, t):
-    return (shift * t) / (1 + (shift - 1) * t)
-
-
-def flux_step(model_output, latents, eta, sigmas, index, sde_solver=True):
-    sigma = sigmas[index]
-    dsigma = sigmas[index + 1] - sigma
-    prev_sample_mean = latents + dsigma * model_output
-    pred_original_sample = latents - sigma * model_output
-
-    delta_t = sigma - sigmas[index + 1]
-    std_dev_t = eta * math.sqrt(delta_t.item())
-
-    if sde_solver:
-        score_estimate = -(latents - pred_original_sample * (1 - sigma)) / sigma ** 2
-        prev_sample_mean = prev_sample_mean + (-0.5 * eta ** 2 * score_estimate) * dsigma
-
-    out = (prev_sample_mean + torch.randn_like(prev_sample_mean) * std_dev_t
-           if std_dev_t > 0 else prev_sample_mean)
-    return out, pred_original_sample
-
-
-# ═══════════════════════ Data Loading ═══════════════════════
+# ═══════════════════════ 相机解析 ══════════════════════════════════════════════
 
 
 def parse_camera_txt(camera_file, img_w, img_h, target_w, target_h):
-    """Parse camera.txt → w2c extrinsics (F,4,4) and intrinsics (F,3,3)."""
+    """camera.txt → OpenCV w2c 外参 (F,4,4) 与内参 (F,3,3)。
+
+    每行格式：idx fx_n fy_n cx_n cy_n 0 0 r00..r22 tx ty tz
+    fx_n/fy_n/cx_n/cy_n 为已按原始图像尺寸归一化的值。
+    """
     ext_list, int_list = [], []
     with open(camera_file, "r") as f:
         lines = f.readlines()
@@ -120,8 +94,8 @@ def parse_camera_txt(camera_file, img_w, img_h, target_w, target_h):
         vals = list(map(float, line.split()))
         fl_x = vals[1] * img_w
         fl_y = vals[2] * img_h
-        cx = vals[3] * img_w
-        cy = vals[4] * img_h
+        cx   = vals[3] * img_w
+        cy   = vals[4] * img_h
         mat34 = np.array(vals[7:19]).reshape(3, 4)
         mat44 = np.eye(4, dtype=np.float64)
         mat44[:3, :] = mat34
@@ -131,32 +105,34 @@ def parse_camera_txt(camera_file, img_w, img_h, target_w, target_h):
     return np.array(ext_list), np.array(int_list)
 
 
-def prepare_inputs(sample_dir: Path, prompt: str, device, dtype,
-                   num_frames: int, target_h: int, target_w: int):
-    """Read a processed sample directory and prepare Gen3R inputs.
+# ═══════════════════════ 数据准备 ══════════════════════════════════════════════
 
-    Returns (prompt, ctrl, plucker, c2ws).
+
+def prepare_inputs(sample_dir: Path, device, dtype, num_frames: int,
+                   target_h: int, target_w: int):
+    """读取样本目录，返回 (ctrl, plucker, prompt_embeds, neg_embeds)。
+
+    ctrl           : [1, 1, 3, H, W]   条件帧（首帧图像）
+    plucker        : [1, F, 6, H, W]   Plücker 射线嵌入
+    prompt_embeds  : list of [1, L, 4096] tensor
+    neg_embeds     : list of [1, L, 4096] tensor
     """
     meta_path = sample_dir / "metadata.json"
-    if meta_path.exists():
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        img_w = meta["img_w"]
-        img_h = meta["img_h"]
-        if not prompt:
-            prompt = meta.get("caption", meta.get("prompt", "")).strip()
-    else:
-        raw = imageio.v2.imread(str(sample_dir / "start.png"))
-        img_h, img_w = raw.shape[:2]
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    img_w = meta["img_w"]
+    img_h = meta["img_h"]
 
-    # Control image
+    # ── 条件图像 ──────────────────────────────────────────────────────────────
     start_arr = imageio.v2.imread(str(sample_dir / "start.png"))[..., :3]
-    ctrl = torch.from_numpy(start_arr).unsqueeze(0).permute(0, 3, 1, 2).unsqueeze(0).float() / 255.0
+    ctrl = (torch.from_numpy(start_arr)
+            .unsqueeze(0).permute(0, 3, 1, 2)   # [1, 3, H, W]
+            .unsqueeze(0).float() / 255.0)        # [1, 1, 3, H, W]
     fh, fw = ctrl.shape[3], ctrl.shape[4]
     scale = target_h / min(fh, fw)
     ctrl = resize(ctrl[0], [round(fh * scale), round(fw * scale)])
     ctrl = center_crop(ctrl, (target_h, target_w)).unsqueeze(0).to(device, dtype)
 
-    # Camera
+    # ── 相机参数 ──────────────────────────────────────────────────────────────
     exts_np, ints_np = parse_camera_txt(
         sample_dir / "camera.txt", img_w, img_h, target_w, target_h)
 
@@ -168,148 +144,46 @@ def prepare_inputs(sample_dir: Path, prompt: str, device, dtype,
         exts_np = exts_np[:num_frames]
         ints_np = ints_np[:num_frames]
 
-    Ks = torch.from_numpy(ints_np).float()
+    Ks    = torch.from_numpy(ints_np).float()
     ext_t = torch.from_numpy(exts_np).float()
+    # camera.txt 是 OpenCV w2c → 求逆得 OpenCV c2w
     c2w_abs = torch.linalg.inv(ext_t)
+    c2ws = preprocess_poses(c2w_abs).unsqueeze(0).to(device, dtype)  # [1, F, 4, 4]
 
-    # camera.txt stores w2c from OpenCV c2w, so c2w is already OpenCV — no flip needed
-    c2ws = preprocess_poses(c2w_abs).unsqueeze(0).to(device, dtype)
+    rays_o, rays_d = compute_rays(c2ws[0].cpu().float(), Ks,
+                                  h=target_h, w=target_w, device="cpu")
+    plucker = torch.cat([torch.cross(rays_o, rays_d, dim=1), rays_d],
+                        dim=1).unsqueeze(0).to(device, dtype)         # [1, F, 6, H, W]
 
-    rays_o, rays_d = compute_rays(c2ws[0].cpu().float(), Ks, h=target_h, w=target_w, device="cpu")
-    plucker = torch.cat([torch.cross(rays_o, rays_d, dim=1), rays_d], dim=1).unsqueeze(0)
-    plucker = plucker.to(device, dtype)
+    # ── 预编码 T5 embedding ───────────────────────────────────────────────────
+    # transformer 期望 list of [L_i, 4096] (每个批次元素一个)，
+    # CFG 用 list + list 拼接：[neg] + [pos] = [neg, pos]，stack 后得到 [2, text_len, 4096]
+    prompt_embed = torch.load(sample_dir / "prompt_embed.pt",
+                              map_location="cpu", weights_only=True)
+    neg_embed = torch.load(sample_dir / "neg_embed.pt",
+                           map_location="cpu", weights_only=True)
+    # 统一到 2D [L, 4096]
+    if prompt_embed.dim() == 3:
+        prompt_embed = prompt_embed.squeeze(0)
+    if neg_embed.dim() == 3:
+        neg_embed = neg_embed.squeeze(0)
 
-    return prompt, ctrl, plucker, c2ws
+    prompt_embeds = [prompt_embed.to(device, dtype)]   # list of [L_pos, 4096]
+    neg_embeds    = [neg_embed.to(device, dtype)]       # list of [L_neg, 4096]
 
-
-# ═══════════════════════ SDE Inference ═══════════════════════
-
-
-@torch.no_grad()
-def run_sde_inference(
-    pipeline, prompt, control_images, control_cameras,
-    device, dtype,
-    eta, num_inference_steps, guidance_scale, shift, seed, num_frames,
-):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-    sigma_schedule = sd3_time_shift(
-        shift, torch.linspace(1, 0, num_inference_steps + 1),
-    ).to(device)
-
-    prompt_embeds, neg_embeds = pipeline.encode_prompt(
-        prompt=prompt, negative_prompt="bad detailed",
-        do_classifier_free_guidance=(guidance_scale > 1.0),
-        num_videos_per_prompt=1, max_sequence_length=512, device=device,
-    )
-    do_cfg = guidance_scale > 1.0
-    in_embeds = neg_embeds + prompt_embeds if do_cfg else prompt_embeds
-
-    F_ctrl = control_cameras.shape[1]
-    B, _, C, H, W = control_images.shape
-    ctrl_full = torch.cat(
-        [control_images,
-         torch.zeros(B, F_ctrl - 1, C, H, W, device=device, dtype=dtype)],
-        dim=1,
-    )
-
-    spatial_ratio = pipeline.geo_adapter.spatial_compression_ratio
-    masks = torch.zeros(B, F_ctrl, H // spatial_ratio, W // spatial_ratio * 2,
-                        device=device, dtype=dtype)
-    masks[:, [0], :, :W // spatial_ratio] = 1
-    masks_padded = torch.cat(
-        [torch.repeat_interleave(masks[:, :1], 4, dim=1), masks[:, 1:]], dim=1,
-    )
-    f_lat = (F_ctrl + 3) // 4
-    masks_lat = (masks_padded
-                 .view(B, f_lat, 4, *masks_padded.shape[-2:])
-                 .contiguous().transpose(1, 2))
-    control_image_latents = pipeline.prepare_control_latents(
-        ctrl_full, masks_lat, dtype=dtype, device=device,
-    )
-
-    cam = control_cameras.transpose(1, 2)
-    cam = torch.cat(
-        [torch.repeat_interleave(cam[:, :, 0:1], 4, dim=2), cam[:, :, 1:]], dim=2,
-    ).transpose(1, 2).contiguous()
-    cam = (cam.view(1, (num_frames + 3) // 4, 4, cam.shape[2], H, W)
-           .transpose(2, 3).contiguous())
-    cam_lat = (cam.view(1, (num_frames + 3) // 4, cam.shape[2] * 4, H, W)
-               .transpose(1, 2).contiguous())
-    cam_lat = torch.cat([cam_lat, cam_lat], dim=-1)
-
-    from PIL import Image
-    import torchvision.transforms.functional as TF
-    clip_pil = Image.fromarray(
-        (ctrl_full[:, 0].squeeze().permute(1, 2, 0).float().cpu().numpy() * 255).astype(np.uint8)
-    )
-    clip_t = TF.to_tensor(clip_pil).sub_(0.5).div_(0.5).to(device, dtype)
-    clip_context = pipeline.clip_image_encoder([clip_t[:, None, :, :]])
-
-    f_lat_size = (num_frames - 1) // 4 + 1
-    h_lat = H // spatial_ratio
-    w_lat = W // spatial_ratio
-    patch_h = pipeline.transformer.config.patch_size[1]
-    patch_w = pipeline.transformer.config.patch_size[2]
-    seq_len = math.ceil((w_lat * 2 * h_lat) / (patch_h * patch_w) * f_lat_size)
-
-    latent_ch = pipeline.geo_adapter.model.z_dim
-    z = torch.randn(1, latent_ch, f_lat_size, h_lat, w_lat * 2, device=device, dtype=dtype)
-
-    pred_x0 = None
-    for i in range(num_inference_steps):
-        t = sigma_schedule[i]
-        timestep = torch.tensor([int(t.item() * 1000)], device=device, dtype=torch.long)
-
-        if do_cfg:
-            z_in = torch.cat([z, z])
-            t_in = timestep.repeat(2)
-            ctrl_in = torch.cat([control_image_latents, control_image_latents])
-            cam_in = torch.cat([cam_lat, cam_lat])
-            clip_in = torch.cat([clip_context, clip_context])
-            with torch.autocast("cuda", dtype=dtype):
-                pred = pipeline.transformer(
-                    x=z_in, context=in_embeds, t=t_in, seq_len=seq_len,
-                    y=ctrl_in, y_camera=cam_in, clip_fea=clip_in,
-                )
-            pred_u, pred_c = pred.chunk(2)
-            pred = pred_u.float() + guidance_scale * (pred_c.float() - pred_u.float())
-        else:
-            with torch.autocast("cuda", dtype=dtype):
-                pred = pipeline.transformer(
-                    x=z, context=in_embeds, t=timestep, seq_len=seq_len,
-                    y=control_image_latents, y_camera=cam_lat, clip_fea=clip_context,
-                )
-            pred = pred.float()
-
-        z, pred_x0 = flux_step(pred, z.float(), eta, sigma_schedule, i, sde_solver=True)
-        z = z.to(dtype)
-
-    return pipeline.decode_latents(pred_x0.to(dtype), min_max_depth_mask=False)
+    return ctrl, plucker, prompt_embeds, neg_embeds
 
 
-# ═══════════════════════ Save ═══════════════════════
-
-
-def save_rollout(output_dir: Path, results: dict, rollout_idx: int) -> bool:
-    if results.get("rgbs") is None:
-        return False
-    rgb = rearrange(results["rgbs"], "b f h w c -> b c f h w").float().cpu()
-    save_videos_grid(rgb, str(output_dir / f"gen_{rollout_idx}.mp4"), rescale=False)
-    return True
+# ═══════════════════════ 文件工具 ══════════════════════════════════════════════
 
 
 def copy_input_files(sample_dir: Path, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    for fname in ["start.png", "gt.mp4", "camera.txt", "gt_depth.npz", "metadata.json"]:
+    for fname in ["start.png", "gt.mp4", "camera.txt", "metadata.json", "gt_depth.npz"]:
         src = sample_dir / fname
         dst = output_dir / fname
         if src.exists() and not dst.exists():
             shutil.copy2(str(src), str(dst))
-
-
-# ═══════════════════════ Entry Points ═══════════════════════
 
 
 def load_manifest(manifest_path: str) -> list:
@@ -321,175 +195,165 @@ def load_manifest(manifest_path: str) -> list:
 
 
 def build_manifest_from_dir(sample_dir: str) -> list:
-    """Build a single-entry manifest from a processed sample directory."""
     p = Path(sample_dir)
     meta_path = p / "metadata.json"
     meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
     return [{
-        "dataset": meta.get("dataset", p.parent.name),
-        "sample_id": meta.get("orig_id", p.name).replace("/", "_"),
+        "dataset":   meta.get("dataset", p.parent.name),
+        "sample_id": meta.get("sample_id", p.name),
         "sample_dir": str(p),
-        "prompt": meta.get("caption", ""),
     }]
 
 
-# ═══════════════════════ Main ═══════════════════════
+# ═══════════════════════ 主流程 ═══════════════════════════════════════════════
 
 
 def main(args):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    rank = int(os.environ.get("RANK", 0))
+    rank       = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
 
     if world_size > 1:
         dist.init_process_group("nccl")
     torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
+    dtype  = torch.bfloat16
 
-    # Build entries list
+    # ── 构建任务列表 ──────────────────────────────────────────────────────────
     if args.manifest:
-        entries = load_manifest(args.manifest)
+        all_entries = load_manifest(args.manifest)
     elif args.sample_dir:
-        entries = build_manifest_from_dir(args.sample_dir)
+        all_entries = build_manifest_from_dir(args.sample_dir)
     else:
-        raise ValueError("Must specify --manifest or --sample_dir")
+        raise ValueError("需要 --manifest 或 --sample_dir")
+
+    # 本进程负责的样本（按 rank 轮询分片）
+    my_entries = all_entries[rank::world_size]
 
     if rank == 0:
-        print(f"\n[Gen3R Infer] samples={len(entries)}  rollouts={args.num_rollouts}")
-        print(f"  checkpoint: {args.checkpoint}")
-        print(f"  eta={args.eta}  steps={args.num_inference_steps}  "
-              f"cfg={args.guidance_scale}  shift={args.shift}")
-        print(f"  output: {args.output_root}\n")
+        print(f"\n[Gen3R Infer] 共 {len(all_entries)} 条样本，本进程处理 {len(my_entries)} 条")
+        print(f"  checkpoint:      {args.checkpoint}")
+        print(f"  num_frames:      {args.num_frames}")
+        print(f"  target_size:     {args.target_size}")
+        print(f"  num_steps:       {args.num_inference_steps}")
+        print(f"  guidance_scale:  {args.guidance_scale}")
+        print(f"  shift:           {args.shift}")
+        print(f"  seed:            {args.seed}")
+        print(f"  output_root:     {args.output_root}\n")
 
-    # Load pipeline
+    # ── 加载官方 pipeline ─────────────────────────────────────────────────────
     pipeline = Gen3RPipeline.from_pretrained(args.checkpoint)
-    for _, mod in pipeline.components.items():
-        if hasattr(mod, "to") and mod is not None:
-            try:
-                mod.to(torch.bfloat16)
-            except Exception:
-                pass
+    pipeline = pipeline.to(device).to(dtype)
+    # 把 text_encoder 移回 CPU（必须在 .to(device) 之后操作）以节省显存；
+    # 因为我们直接传 prompt_embeds，encode_prompt 不会实际调用 T5 forward。
+    if pipeline.text_encoder is not None:
+        pipeline.text_encoder = pipeline.text_encoder.cpu()
+        torch.cuda.empty_cache()
 
-    if args.device_mode == "local":
-        pipeline.enable_model_cpu_offload(gpu_id=local_rank)
-        device = pipeline._execution_device
-    else:
-        device = torch.device(f"cuda:{local_rank}")
-        pipeline = pipeline.to(device)
+    # pipeline.check_inputs 会对 list 类型的 prompt_embeds 调用 .shape 而报错；
+    # 我们传 prompt="" + prompt_embeds=list 并存，所以只保留必要检查。
+    def _check_inputs_patched(prompt, height, width, negative_prompt,
+                              cbs_ti, prompt_embeds=None, negative_prompt_embeds=None):
+        if height % 14 != 0 or width % 14 != 0:
+            raise ValueError(f"`height` and `width` must be divisible by 14.")
+    pipeline.check_inputs = _check_inputs_patched
 
-    dtype = torch.bfloat16
-    my_rollouts = list(range(rank, args.num_rollouts, world_size))
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
 
-    for entry_idx, entry in enumerate(entries):
-        dataset = entry.get("dataset", "unknown")
+    for entry_idx, entry in enumerate(my_entries):
+        dataset   = entry.get("dataset", "unknown")
         sample_id = entry.get("sample_id", f"sample_{entry_idx}")
         sample_dir = Path(entry["sample_dir"])
-        prompt = entry.get("prompt", "")
-
         output_dir = Path(args.output_root) / dataset / sample_id
 
-        if args.skip_done:
-            all_done = all(
-                (output_dir / f"gen_{i}.mp4").exists()
-                for i in range(args.num_rollouts)
-            )
-            if all_done:
-                if rank == 0:
-                    print(f"[{entry_idx+1}/{len(entries)}] skip (done): {dataset}/{sample_id}")
-                if world_size > 1:
-                    dist.barrier()
-                continue
-
-        if rank == 0:
-            print(f"\n[{entry_idx+1}/{len(entries)}] {dataset}/{sample_id}")
-            copy_input_files(sample_dir, output_dir)
-
-        if world_size > 1:
-            dist.barrier()
-
-        try:
-            prompt_used, ctrl, plucker, c2ws = prepare_inputs(
-                sample_dir, prompt, device, dtype,
-                args.num_frames, args.target_size, args.target_size,
-            )
-        except Exception as e:
-            print(f"[Rank {rank}] input error: {e}")
-            if world_size > 1:
-                dist.barrier()
+        out_video = output_dir / "gen_0.mp4"
+        if args.skip_done and out_video.exists():
+            print(f"[{rank}] skip (done): {dataset}/{sample_id}")
             continue
 
-        for rollout_idx in my_rollouts:
-            out_video = output_dir / f"gen_{rollout_idx}.mp4"
-            if args.skip_done and out_video.exists():
-                continue
+        print(f"[{rank}] [{entry_idx+1}/{len(my_entries)}] {dataset}/{sample_id}")
+        copy_input_files(sample_dir, output_dir)
 
-            seed = args.base_seed + entry_idx * args.num_rollouts + rollout_idx
-            print(f"  [Rank {rank}] gen_{rollout_idx}.mp4  seed={seed}")
-            try:
-                results = run_sde_inference(
-                    pipeline=pipeline, prompt=prompt_used,
-                    control_images=ctrl, control_cameras=plucker,
-                    device=device, dtype=dtype,
-                    eta=args.eta, num_inference_steps=args.num_inference_steps,
-                    guidance_scale=args.guidance_scale, shift=args.shift,
-                    seed=seed, num_frames=args.num_frames,
-                )
-                if save_rollout(output_dir, results, rollout_idx):
-                    print(f"  [Rank {rank}] gen_{rollout_idx}.mp4 saved")
-            except Exception as e:
-                print(f"  [Rank {rank}] gen_{rollout_idx} failed: {e}")
-
-        if rank == 0:
-            info = {
-                "checkpoint": args.checkpoint,
-                "num_rollouts": args.num_rollouts,
-                "eta": args.eta,
-                "num_inference_steps": args.num_inference_steps,
-                "guidance_scale": args.guidance_scale,
-                "shift": args.shift,
-                "num_frames": args.num_frames,
-                "target_size": args.target_size,
-                "base_seed": args.base_seed,
-            }
-            (output_dir / "infer_info.json").write_text(
-                json.dumps(info, indent=2), encoding="utf-8",
+        try:
+            ctrl, plucker, prompt_embeds, neg_embeds = prepare_inputs(
+                sample_dir, device, dtype,
+                num_frames=args.num_frames,
+                target_h=args.target_size,
+                target_w=args.target_size,
             )
+        except Exception as e:
+            print(f"  [rank {rank}] 输入准备失败: {e}")
+            continue
 
-        if world_size > 1:
-            dist.barrier()
+        try:
+            with torch.no_grad():
+                sample = pipeline(
+                    prompt="",                # 非 None 使 batch_size=1，绕过 prompt_embeds.shape 检查
+                    negative_prompt="bad detailed",  # 与官方推理一致
+                    prompt_embeds=prompt_embeds,
+                    negative_prompt_embeds=neg_embeds,
+                    control_cameras=plucker,
+                    control_images=ctrl,
+                    num_frames=args.num_frames,
+                    height=args.target_size,
+                    width=args.target_size,
+                    guidance_scale=args.guidance_scale,
+                    shift=args.shift,
+                    num_inference_steps=args.num_inference_steps,
+                    return_dict=True,
+                    min_max_depth_mask=True,  # 与官方推理一致
+                )
 
-    if rank == 0:
-        print(f"\n[Gen3R Infer] Done. Output: {args.output_root}")
+            rgbs = sample.rgbs  # [B, F, H, W, 3]
+            rgb_grid = rearrange(rgbs, "b f h w c -> b c f h w").float().cpu()
+            save_videos_grid(rgb_grid, str(out_video), rescale=False)
+            print(f"  [rank {rank}] gen_0.mp4 保存成功")
+
+        except Exception as e:
+            import traceback
+            print(f"  [rank {rank}] 推理失败: {e}")
+            traceback.print_exc()
+            continue
+
+        # 写推理参数记录
+        info = {
+            "checkpoint":          args.checkpoint,
+            "num_inference_steps": args.num_inference_steps,
+            "guidance_scale":      args.guidance_scale,
+            "shift":               args.shift,
+            "num_frames":          args.num_frames,
+            "target_size":         args.target_size,
+            "seed":                args.seed,
+            "sampler":             "ODE (FlowMatch)",
+        }
+        (output_dir / "infer_info.json").write_text(
+            json.dumps(info, indent=2), encoding="utf-8")
 
     if world_size > 1:
+        dist.barrier()
         dist.destroy_process_group()
+
+    if rank == 0:
+        print(f"\n[Gen3R Infer] 完成。输出: {args.output_root}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Gen3R official pipeline inference")
+    parser = argparse.ArgumentParser(description="Gen3R 官方 pipeline ODE 推理")
 
-    # Input (one of these required)
-    input_group = parser.add_mutually_exclusive_group(required=True)
-    input_group.add_argument("--manifest", type=str, help="manifest.jsonl path")
-    input_group.add_argument("--sample_dir", type=str, help="Single processed sample directory")
+    input_grp = parser.add_mutually_exclusive_group(required=True)
+    input_grp.add_argument("--manifest",   type=str, help="manifest.jsonl 路径")
+    input_grp.add_argument("--sample_dir", type=str, help="单条样本目录（调试用）")
 
-    # Model
-    parser.add_argument("--checkpoint", type=str, required=True,
-                        help="Gen3R checkpoint directory")
-    parser.add_argument("--output_root", type=str, required=True)
-
-    # Inference params
-    parser.add_argument("--num_rollouts", type=int, default=8)
-    parser.add_argument("--num_frames", type=int, default=49)
-    parser.add_argument("--target_size", type=int, default=560)
-    parser.add_argument("--eta", type=float, default=0.3)
-    parser.add_argument("--num_inference_steps", type=int, default=50)
-    parser.add_argument("--guidance_scale", type=float, default=5.0)
-    parser.add_argument("--shift", type=float, default=2.0)
-    parser.add_argument("--base_seed", type=int, default=42)
-
-    # Runtime
-    parser.add_argument("--skip_done", action="store_true")
-    parser.add_argument("--device_mode", choices=["local", "server"], default="server",
-                        help="local=CPU offload, server=full GPU load")
+    parser.add_argument("--checkpoint",          type=str, required=True,
+                        help="Gen3R checkpoint 目录")
+    parser.add_argument("--output_root",         type=str, required=True)
+    parser.add_argument("--num_frames",          type=int,   default=49)
+    parser.add_argument("--target_size",         type=int,   default=560)
+    parser.add_argument("--num_inference_steps", type=int,   default=50)
+    parser.add_argument("--guidance_scale",      type=float, default=5.0)
+    parser.add_argument("--shift",               type=float, default=5.0)
+    parser.add_argument("--seed",                type=int,   default=42)
+    parser.add_argument("--skip_done",           action="store_true")
 
     main(parser.parse_args())

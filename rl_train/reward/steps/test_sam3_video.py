@@ -32,7 +32,7 @@ for _p in [str(_SAM3_SRC), str(_SAM3_SRC / "sam3"), str(_SAM3_PKG)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-_MODEL_DIR = Path(os.environ.get("RL_MODEL_ROOT", str(_RL_CODE_DIR.parent / "RL" / "model")))
+_MODEL_DIR = Path(os.environ.get("RL_MODEL_ROOT", str(_RL_CODE_DIR / "model")))
 SAM3_CKPT = str(_MODEL_DIR / "SAM3" / "sam3.pt")
 SAM3_BPE = str(_SAM3_PKG / "sam3" / "assets" / "bpe_simple_vocab_16e6.txt.gz")
 

@@ -31,7 +31,7 @@ import torchvision.transforms as T
 from PIL import Image
 
 _THIRD_PARTY_DIR = Path(__file__).resolve().parent.parent
-_WORKSPACE = _THIRD_PARTY_DIR.parent.parent  # /home/users/.../
+_RL_CODE_DIR = _THIRD_PARTY_DIR.parent
 
 FEATUP_ROOT = str(_THIRD_PARTY_DIR / "repos" / "FeatUp")
 
@@ -56,7 +56,7 @@ class DINOv2BilinearExtractor(nn.Module):
         self.patch_size = 14
         self.dim = 384
         _model_root = Path(os.environ.get(
-            "RL_MODEL_ROOT", str(_WORKSPACE / "RL" / "model")))
+            "RL_MODEL_ROOT", str(_RL_CODE_DIR / "model")))
         _dinov2_local = _model_root / "dinov2_repo"
         if _dinov2_local.is_dir():
             print(f"[DINOv2] Loading from local repo: {_dinov2_local}")

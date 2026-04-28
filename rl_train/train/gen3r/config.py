@@ -59,6 +59,7 @@ class GRPOConfig:
     train_timestep_strategy: str = "front"       # "front" | "random"
     sde_fraction: float = 0.4                    # front 模式下 SDE 步比例
     timestep_fraction: float = 0.5              # random 模式下训练步比例
+    train_steps_count: int = 0                   # front 模式下训练阶段截取前 N 个 SDE 步（0=全部）
 
     # PPO/GRPO ratio clip
     clip_range: float = 1e-4
@@ -146,13 +147,24 @@ def build_parser() -> argparse.ArgumentParser:
     mg.add_argument("--trainable_modules", nargs="*", default=None,
                     help="可训练模块名称（含此子串的参数才训练）。None=全部训练")
     mg.add_argument("--gradient_checkpointing", action="store_true",
-                    help="开启梯度检查点（时间换显存）")
+                    help="开启梯度检查点（时间换显存）。"
+                         "全局开关，等价于 --gradient_checkpoint_layers=-1（所有 block 都 ckpt）。"
+                         "若同时给 --gradient_checkpoint_layers，后者优先。")
+    mg.add_argument("--gradient_checkpoint_layers", type=int, default=0,
+                    help="选择性梯度检查点：开前 N 个 block 的 ckpt，其余正常 forward。"
+                         "0（默认）= 全关。 -1 = 全开（等价 --gradient_checkpointing）。"
+                         "8 ≈ 在 H100 80G 上恰好放下 N=8/K=50/train_T=30/res=560 的 P3，速度损失 ~8%%。"
+                         "颗粒度在 block 级（wan transformer 30 个 block，每开 1 层省 ~1.7GB activation）。")
 
     # ── 数据 ──────────────────────────────────────────────────────────────────
     dg = p.add_argument_group("Data")
     dg.add_argument("--data_root", type=str, required=True, help="数据根目录")
     dg.add_argument("--datasets", type=str, default="re10k,dl3dv",
-                    help="逗号分隔的数据集名称")
+                    help="逗号分隔的数据集名称（manifest 模式下用作 dataset 字段过滤）")
+    dg.add_argument("--train_manifest", type=str, default="",
+                    help="训练样本 manifest jsonl 路径（推荐）。每行 {dataset, sample_id, "
+                         "sample_dir, metadata_json, ...}。设置后 RLDataset 直接读 manifest，"
+                         "不再扫 data_root/<ds>/<sample> 目录。空字符串 = 走目录扫描兼容模式。")
     dg.add_argument("--num_frames", type=int, default=17, help="每样本采样帧数")
     dg.add_argument("--frame_stride", type=int, default=2, help="帧间隔")
     dg.add_argument("--resolution", type=int, default=560, help="图像分辨率")
@@ -163,11 +175,28 @@ def build_parser() -> argparse.ArgumentParser:
     dg.add_argument("--num_samples_subset", type=int, default=None,
                     help="若设置 N，则用固定 sampler_seed 从全量数据中抽 N 条做 smoke test。"
                          "默认 None=全量训练。")
+    dg.add_argument("--p3_synthetic", action="store_true",
+                    help="P3 显存压力测试模式：跳过 worker pool / rollout / reward，"
+                         "用随机 tensor 模拟所有 Phase 1/2 输出，直接进 grpo_update。"
+                         "用于快速验证 GRPO update 显存峰值，~3min 一轮。")
+    dg.add_argument("--p3_max_iters", type=int, default=0,
+                    help="grpo_update 内只跑 N 个 forward+backward iter 后立即返回，"
+                         "用于快速测显存峰值。0=正常跑完所有 iter。"
+                         "搭配 --p3_synthetic 可在 ~30s 内测出 P3 peak_alloc。")
 
     # ── GRPO 超参数 ────────────────────────────────────────────────────────────
     gg = p.add_argument_group("GRPO")
     gg.add_argument("--num_generations", type=int, default=8,
-                    help="每样本 rollout 数（组内归一化组大小）")
+                    help="每样本 rollout 数（GRPO 组内归一化组大小，G）。"
+                         "16×H100 正式训练：G=8（一个 group 内 8 个 rollout 共享同一 prompt）。")
+    gg.add_argument("--rollouts_per_rank", type=int, default=0,
+                    help="每张 GPU 负责的 rollout 数（R）。"
+                         "0（默认）= 兼容旧路径：R = num_generations，每卡独立完成一个 group。"
+                         ">0 时启用 sub-group 模式：ranks_per_group = G/R 张卡共享 1 个 prompt，"
+                         "在 sub-group 内做 reward all_gather + 组内 advantage 归一化。"
+                         "16×H100 正式训练设 4：8 group × 8 rollout / step，"
+                         "每卡 4 rollout × 16 卡 = 64 rollout / step。"
+                         "要求 num_generations 必须能被 rollouts_per_rank 整除。")
     gg.add_argument("--init_same_noise", action="store_true")
     gg.add_argument("--sampling_steps", type=int, default=50, help="去噪总步数")
     gg.add_argument("--eta", type=float, default=0.2, help="SDE 噪声强度（>0）")
@@ -186,15 +215,32 @@ def build_parser() -> argparse.ArgumentParser:
                     choices=["front", "random"],
                     help="front=前 sde_fraction 步训练; random=随机打乱取比例")
     gg.add_argument("--sde_fraction", type=float, default=0.4,
-                    help="front 策略下 SDE 步占总步数的比例")
+                    help="front 策略下 SDE 步占总步数的比例（rollout 阶段）。"
+                         "1.0 = 全部步骤都是 SDE，全部 timestep 都记录 log_prob。")
     gg.add_argument("--timestep_fraction", type=float, default=0.5,
                     help="random 策略下训练时间步比例")
+    gg.add_argument("--train_steps_count", type=int, default=0,
+                    help="front 策略下，训练阶段对前 N 个 SDE timestep 计算梯度。"
+                         "0（默认）= 用全部 K 个 SDE 步（K = sampling_steps × sde_fraction）。"
+                         ">0 时取 min(K, train_steps_count)。"
+                         "用法举例：sampling_steps=50 + sde_fraction=1.0 + train_steps_count=30 "
+                         "→ rollout 50 步全 SDE，但只对前 30 步计算策略梯度。")
     gg.add_argument("--clip_range", type=float, default=1e-4,
                     help="GRPO ratio 裁剪范围 ε")
     gg.add_argument("--adv_clip_max", type=float, default=5.0,
                     help="Advantage 裁剪上限")
     gg.add_argument("--kl_coeff", type=float, default=0.01,
                     help="KL 散度系数 β（0=关闭 KL 正则化）")
+    gg.add_argument("--train_microbatch_size", type=int, default=1,
+                    help="Phase 3 GRPO update 每个 timestep 一次性塞多少条 rollout 进 transformer。"
+                         "1=老逻辑（每条 rollout 单独 fwd/bwd，N×train_T 次）；"
+                         ">1=同 timestep 把若干 rollout 拼到 batch 维一次跑。"
+                         "受 num_generations 限制（必须整除）。"
+                         "建议：ckpt ON 时 4；ckpt OFF 时 1。")
+    gg.add_argument("--vae_decode_micro_batch", type=int, default=4,
+                    help="Phase 1 末尾批量 VAE decode 时每批多少条 rollout。"
+                         "默认 4，过大可能 OOM（H100 80GB 上 8 也能跑）。"
+                         "1 = 退化为旧的逐条解码。")
 
     # ── 训练 ──────────────────────────────────────────────────────────────────
     tg = p.add_argument_group("Training")
@@ -210,7 +256,28 @@ def build_parser() -> argparse.ArgumentParser:
     tg.add_argument("--output_dir", type=str, default="./outputs/grpo_gen3r_v2")
     tg.add_argument("--eval_output_dir", type=str, default=None)
     tg.add_argument("--checkpointing_steps", type=int, default=50,
-                    help="每 N 步保存一次 checkpoint")
+                    help="[旧接口] 每 N 步保存一次 checkpoint。"
+                         "若同时给了 --permanent_ckpt_every，以后者为准。")
+    tg.add_argument("--rolling_ckpt_every", type=int, default=4,
+                    help="滚动 checkpoint 步频（短期）。每 N 步保存一次，"
+                         "保存新的同时删除上一个滚动 ckpt（即只保留最新 1 份）。"
+                         "用于断电/抢占恢复，不长期占盘。0 = 关闭滚动 ckpt。")
+    tg.add_argument("--permanent_ckpt_every", type=int, default=50,
+                    help="永久 checkpoint 步频（长期）。每 N 步保存一次且不删除，"
+                         "作为里程碑节点。0 = 关闭永久 ckpt（不推荐）。")
+    tg.add_argument("--keep_last_n_permanent", type=int, default=0,
+                    help="永久 ckpt 最大保留数量。0（默认）= 不限制；>0 时只保留最新 N 个，"
+                         "更老的会被删除。用于长跑磁盘紧张时。")
+    tg.add_argument("--resume_from", type=str, default="",
+                    help="断点恢复路径。"
+                         " 空字符串    = 从头训练（默认）。"
+                         " 'auto'      = 在 --output_dir 下自动找 step 最大的 ckpt 续训"
+                         "              （rolling > permanent > checkpoint 优先级）。"
+                         " 显式路径    = 指定一个 ckpt 目录（如 /.../rolling-80）。"
+                         "恢复时会还原 model 权重 + global_step + sampler_seed，"
+                         "并跳过已用过的样本（按 step × n_groups_total 复现样本顺序）。"
+                         "注意：optimizer/scheduler 状态目前不持久化，恢复后前几步 loss "
+                         "会有短暂抖动属正常现象。")
     tg.add_argument("--use_8bit_adam", action="store_true",
                     help="用 bitsandbytes.optim.AdamW8bit 替代 torch.optim.AdamW，"
                          "把 optimizer state 从 4B/param 压到 1B/param，"
@@ -241,10 +308,28 @@ def build_parser() -> argparse.ArgumentParser:
                     help='JSON 格式分卡方案: \'{"da3":[0,1],"qwen_sam3":[2,3],'
                          '"dinov2_extract":[4,5],"videoalign":[6,7]}\'')
     rg.add_argument("--reward_dispatch_mode", type=str, default="centralized",
-                    choices=["centralized", "per_rank"],
-                    help="centralized=rank0 起 4 线程绑定 4 张 GPU 各跑一种 reward；"
-                         "per_rank=旧逻辑，每个 DDP rank 自己跑 reward 子进程。"
-                         "centralized 模式下 --reward_gpu_assignment 无效。")
+                    choices=["centralized", "per_rank", "workers"],
+                    help="workers=新架构，每个 rank 起 3 个常驻 worker 子进程"
+                         "（DA3/DINOv2/VideoAlign），中间产物走 /dev/shm，主进程"
+                         "自己 GPU 聚合 reward；centralized=rank0 起 4 线程绑 4 GPU；"
+                         "per_rank=旧逻辑（每 rank 各跑 reward 子进程）。")
+    rg.add_argument("--geo_compare_mode", type=str, default="all_pairs",
+                    choices=["first_frame", "adjacent", "all_pairs"],
+                    help="geo_global / geo_semantic 投影时帧对策略。"
+                         "all_pairs=每帧 vs 其它所有帧（默认，AP 方案）。")
+    rg.add_argument("--feature_compare_mode", type=str, default="first_frame",
+                    choices=["first_frame", "adjacent", "all_pairs"],
+                    help="feature_sim (DINOv2) warping 时帧对策略。"
+                         "first_frame=每帧投影到第 0 帧，按有效像素求 cosine 均值（最终选定）。"
+                         "all_pairs=每帧 vs 其它所有帧（与 DA3 几何对齐，但 N^2 计算量太大）。")
+    rg.add_argument("--va_micro_batch", type=int, default=0,
+                    help="VideoAlign worker 单次 inferencer.reward(...) 接收的视频条数上限。"
+                         "0 = 一次性把全部 N 条 rollout 真 batch（多卡训练时 VideoAlign 独占一张 "
+                         "H100，足够吃下 N=8）。"
+                         ">0 = 把 N 条切成多个大小为 va_micro_batch 的 chunk，串行跑 "
+                         "（单卡 smoke 必须用 1 或 2，否则 Qwen2-VL attention 会 OOM）。")
+    rg.add_argument("--reward_agg_micro_batch", type=int, default=2,
+                    help="主进程聚合 reward 时的 micro batch（每 N 条 rollout empty_cache 一次）。")
 
     return p
 
@@ -261,5 +346,15 @@ def parse_args() -> argparse.Namespace:
         args.cfg_rollout = args.cfg_infer
     if args.cfg_train < 0:
         args.cfg_train = args.cfg_infer
+
+    # ── rollouts_per_rank 校验 ───────────────────────────────────────────────
+    # 0 = 旧路径：每卡独立 1 个完整 group，R = G
+    if args.rollouts_per_rank == 0:
+        args.rollouts_per_rank = args.num_generations
+    if args.num_generations % args.rollouts_per_rank != 0:
+        raise ValueError(
+            f"num_generations ({args.num_generations}) 必须被 rollouts_per_rank "
+            f"({args.rollouts_per_rank}) 整除"
+        )
 
     return args

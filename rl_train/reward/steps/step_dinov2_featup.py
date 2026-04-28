@@ -65,7 +65,7 @@ class DINOv2BilinearExtractor(nn.Module):
         self.patch_size = 14
         self.dim = 384
         _model_root = Path(os.environ.get(
-            "RL_MODEL_ROOT", str(_RL_CODE_DIR.parent / "RL" / "model")))
+            "RL_MODEL_ROOT", str(_RL_CODE_DIR / "model")))
         _dinov2_local = _model_root / "dinov2_repo"
         if _dinov2_local.is_dir():
             print(f"[DINOv2] Loading from local repo: {_dinov2_local}")

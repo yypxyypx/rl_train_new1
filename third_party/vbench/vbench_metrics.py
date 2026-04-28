@@ -154,9 +154,20 @@ def load_dino_model(vbench_cache: str, device: str):
 
 
 def load_dreamsim_model(vbench_cache: str, device: str):
-    """从本地缓存加载 DreamSim（i2v_background 用）。"""
+    """从本地缓存加载 DreamSim（i2v_background 用）。
+    
+    DreamSim ensemble 需要 ~1.2GB 远程权重，若未缓存则跳过。
+    通过检测 ensemble_lora 目录是否存在来避免触发下载。
+    """
     from dreamsim import dreamsim
     dreamsim_cache_dir = os.path.join(vbench_cache, "dreamsim_cache")
+    # 只在权重已完整缓存时才运行，避免触发网络下载
+    ensemble_lora_dir = os.path.join(dreamsim_cache_dir, "ensemble_lora")
+    if not os.path.isdir(ensemble_lora_dir):
+        raise FileNotFoundError(
+            f"DreamSim ensemble 权重未缓存: {ensemble_lora_dir}\n"
+            "请先手动下载: https://github.com/ssundaram21/dreamsim#usage"
+        )
     result = dreamsim(pretrained=True, cache_dir=dreamsim_cache_dir, device=device)
     # 不同版本的 dreamsim() 返回值格式不同：(model, preprocess) 元组或单个模型
     if isinstance(result, tuple):
